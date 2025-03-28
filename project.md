@@ -1,6 +1,5 @@
-Okay, let's outline a plan for creating a real-time agent simulation game where agents learn, invent, share skills, and cooperate, aiming for a "like real life" feel. This is a complex undertaking, so the plan will be phased.
 
-**Project Title:** Project Genesis (or similar)
+**Project Title:** Project Genesis 
 
 **Core Vision:** A persistent, real-time simulation sandbox where autonomous agents evolve complex behaviors, skills, and social structures through interaction with the environment and each other.
 
