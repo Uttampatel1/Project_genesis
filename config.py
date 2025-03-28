@@ -11,6 +11,15 @@ GRID_WIDTH = GAME_WIDTH // CELL_SIZE
 GRID_HEIGHT = SCREEN_HEIGHT // CELL_SIZE
 FPS = 15 # Simulation steps per second
 
+# --- Debug Flags ---
+DEBUG_PATHFINDING = False # Print pathfinding details
+DEBUG_AGENT_AI = False    # Print agent utility scores
+DEBUG_AGENT_CHOICE = True   # Print chosen action and basic info
+DEBUG_AGENT_ACTIONS = True  # Print action execution steps (Gather, Craft, Eat, etc.)
+DEBUG_SOCIAL = True       # Print social interactions (signals, learning, helping)
+DEBUG_KNOWLEDGE = False   # Print knowledge updates (recipes, locations)
+DEBUG_WORLD_GEN = False   # Print detailed world gen steps (can be verbose)
+
 # Colors
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
@@ -26,119 +35,133 @@ UI_BG_COLOR = (50, 50, 50)
 UI_TEXT_COLOR = (200, 200, 200)
 
 # Time System
-SIMULATION_SPEED_FACTOR = 50 # How many simulation seconds pass per real second
-DAY_LENGTH_SECONDS = 60 * 5 # How long a full day-night cycle lasts in simulation time
+SIMULATION_SPEED_FACTOR = 50 # How many simulation seconds pass per real second (e.g., 50 means 1 min real time = ~50 min sim time)
+DAY_LENGTH_SECONDS = 60 * 10 # How long a full day-night cycle lasts in simulation time (e.g., 600 sim seconds = 1 day)
 
 # World Generation
 NUM_WATER_PATCHES = 5
 WATER_PATCH_SIZE = (3, 8)
-NUM_FOOD_SOURCES = 20
-NUM_TREES = 15       # Phase 2+
-NUM_ROCKS = 10       # Phase 2+
-NUM_INITIAL_WORKBENCHES = 0 # Phase 3+ (Agents must build)
-RESOURCE_REGEN_RATE = 0.01 # Chance per second resource quantity increases (if applicable)
+NUM_FOOD_SOURCES = 30 # Increased food slightly
+NUM_TREES = 25       # Increased wood slightly
+NUM_ROCKS = 15       # Increased stone slightly
+NUM_INITIAL_WORKBENCHES = 1 # Start with one workbench for testing Phase 3+
+RESOURCE_REGEN_RATE = 0.005 # Chance per sim second resource quantity increases (if applicable) - Reduced regen
 
 # Agent Defaults
 INITIAL_AGENT_COUNT = 10
 MAX_HEALTH = 100
 MAX_ENERGY = 100
-MAX_HUNGER = 100 # Lower value means more hungry
-MAX_THIRST = 100 # Lower value means more thirsty
-INVENTORY_CAPACITY = 20 # Phase 2+
+MAX_HUNGER = 100 # Higher value means MORE hungry (0 = full)
+MAX_THIRST = 100 # Higher value means MORE thirsty (0 = full)
+INVENTORY_CAPACITY = 20
 
-# Needs Decay Rates (per simulation second) - Adjusted Phase 1
-HEALTH_REGEN_RATE = 0.05 # While resting
-ENERGY_DECAY_RATE = 0.18 # Slightly reduced
-ENERGY_REGEN_RATE = 1.0 # While resting
-HUNGER_INCREASE_RATE = 0.45 # Slightly increased
-THIRST_INCREASE_RATE = 0.65 # Slightly increased
+# Needs Decay Rates (per simulation second)
+HEALTH_REGEN_RATE = 0.1  # While resting and needs met
+ENERGY_DECAY_RATE = 0.20 # Increased energy decay slightly
+ENERGY_REGEN_RATE = 1.5  # While resting
+HUNGER_INCREASE_RATE = 0.50 # Rate at which hunger value increases
+THIRST_INCREASE_RATE = 0.70 # Rate at which thirst value increases
 
 # Action Costs / Effects
-MOVE_ENERGY_COST = 0.1
-EAT_HUNGER_REDUCTION = 40
-DRINK_THIRST_REDUCTION = 50
-REST_ENERGY_RECOVERY = 10 # Covered by ENERGY_REGEN_RATE
-GATHER_ENERGY_COST = 0.5 # Phase 2+
-CRAFT_ENERGY_COST = 1.0  # Phase 2+
-INVENT_ENERGY_COST = 1.5 # Phase 3+
-TEACH_ENERGY_COST = 0.3 # Phase 4+
-LEARN_ENERGY_COST = 0.1 # Phase 4+
+MOVE_ENERGY_COST = 0.08 # Reduced move cost slightly
+EAT_HUNGER_REDUCTION = 50
+DRINK_THIRST_REDUCTION = 60
+GATHER_BASE_DURATION = 2.0 # Base time in sim seconds to gather 1 unit
+GATHER_ENERGY_COST = 0.6   # Base energy cost per gather action (can be modified by tools/skill)
+CRAFT_BASE_DURATION = 4.0  # Base time in sim seconds to craft an item
+CRAFT_ENERGY_COST = 1.2
+INVENT_BASE_DURATION = 8.0 # Base time in sim seconds for an invention attempt
+INVENT_ENERGY_COST = 2.0
+TEACH_ENERGY_COST = 0.5
+LEARN_ENERGY_COST = 0.2
+HELP_ENERGY_COST = 0.3    # Energy cost for the helper when performing a help action
 
 # AI Settings
-WANDER_RADIUS = 5
-UTILITY_THRESHOLD = 0.2 # Minimum utility score to consider an action (lowered slightly)
-AGENT_VIEW_RADIUS = 10 # How far agents can "see" for finding resources/agents (used in find_nearest_*)
+WANDER_RADIUS = 6
+UTILITY_THRESHOLD = 0.15 # Minimum utility score to consider an action (lower means more exploration)
+AGENT_VIEW_RADIUS = 25   # How far agents can "see" for finding resources/agents (used in find_nearest_*)
+WORKBENCH_INTERACTION_RADIUS = 1 # Chebyshev distance (0=on tile, 1=adjacent) required to use workbench
 
-# Phase 2+ Skill Settings
+# Skill Settings
 INITIAL_SKILL_LEVEL = 0
 MAX_SKILL_LEVEL = 100
-SKILL_INCREASE_RATE = 0.5 # Base increase per successful action
-TEACHING_BOOST_FACTOR = 4.0 # Multiplier for skill gain when taught (Phase 4+)
+SKILL_INCREASE_RATE = 0.8 # Base increase per successful action (adjusted by diminishing returns)
+TEACHING_BOOST_FACTOR = 5.0 # Multiplier for skill gain when taught
 
-# Phase 2+ Crafting Recipes (Example)
-# Format: 'result_item': {'ingredients': {'item1': count, 'item2': count}, 'skill': 'skill_name', 'min_level': level, 'workbench': bool}
-RECIPES = {
-    'CrudeAxe': {
-        'ingredients': {'Wood': 1, 'Stone': 1},
-        'skill': 'BasicCrafting',
-        'min_level': 1,
-        'workbench': False # Does it require a workbench?
-    },
-    'Workbench': { # Phase 3+
-        'ingredients': {'Wood': 4, 'Stone': 2},
-        'skill': 'BasicCrafting',
-        'min_level': 5,
-        'workbench': False # You don't need a workbench to make the first one
-    },
-     'SmallShelter': { # Phase 2+, updated Phase 3
-         'ingredients': {'Wood': 5},
-         'skill': 'BasicCrafting',
-         'min_level': 10, # Increased level slightly
-         'workbench': True # Let's say shelter needs more precise work
-     },
-     'StonePick': { # Example expansion
-         'ingredients': {'Wood': 2, 'Stone': 3},
-         'skill': 'BasicCrafting',
-         'min_level': 8,
-         'workbench': True
-     }
-    # Add more recipes here
+# Tool Settings (Multipliers for speed/efficiency)
+TOOL_EFFICIENCY = {
+    'CrudeAxe': 1.8,
+    'StonePick': 1.8,
+    # Add other tools here
 }
 
-# --- Terrain/Resource Codes ---
+# Crafting Recipes
+# Format: 'result_item': {'ingredients': {'item1': count,...}, 'skill': 'skill_name', 'min_level': level, 'workbench': bool}
+RECIPES = {
+    'CrudeAxe': {
+        'ingredients': {'Wood': 2, 'Stone': 1}, # Adjusted ingredients slightly
+        'skill': 'BasicCrafting',
+        'min_level': 1,
+        'workbench': False
+    },
+    'StonePick': {
+        'ingredients': {'Wood': 2, 'Stone': 3},
+        'skill': 'BasicCrafting',
+        'min_level': 5, # Requires slightly more skill
+        'workbench': True # Let's require workbench for a better tool
+     },
+    'Workbench': {
+        'ingredients': {'Wood': 5, 'Stone': 2}, # Increased wood cost
+        'skill': 'BasicCrafting',
+        'min_level': 3, # Lowered skill requirement for first workbench
+        'workbench': False # Can make the first one anywhere
+    },
+     'SmallShelter': {
+         'ingredients': {'Wood': 8}, # Increased wood cost
+         'skill': 'BasicCrafting',
+         'min_level': 8,
+         'workbench': True # Requires workbench
+     },
+    # Add more recipes here (e.g., better tools, food items, containers)
+    # 'WoodenTorch': {'ingredients': {'Wood': 1}, 'skill': 'BasicCrafting', 'min_level': 2, 'workbench': False},
+    # 'CookedFood': {'ingredients': {'Food': 1, 'Wood': 1}, 'skill': 'Cooking', 'min_level': 1, 'workbench': True}, # Requires 'Campfire' object?
+}
+
+# Terrain/Resource Codes
 TERRAIN_GROUND = 0
 TERRAIN_WATER = 1
-TERRAIN_OBSTACLE = 2 # Impassable terrain like mountains (can use DARK_GRAY)
+TERRAIN_OBSTACLE = 2 # Impassable terrain
 
 RESOURCE_NONE = 0
 RESOURCE_FOOD = 1
 RESOURCE_WATER = 2 # Water terrain implicitly provides water
-RESOURCE_WOOD = 3  # Phase 2+
-RESOURCE_STONE = 4 # Phase 2+
-RESOURCE_WORKBENCH = 5 # Phase 3+
+RESOURCE_WOOD = 3
+RESOURCE_STONE = 4
+RESOURCE_WORKBENCH = 5
 
-# --- Map terrain to colors ---
+# Map terrain to colors
 TERRAIN_COLORS = {
     TERRAIN_GROUND: GREEN,
     TERRAIN_WATER: BLUE,
-    TERRAIN_OBSTACLE: DARK_GRAY, # Updated color
+    TERRAIN_OBSTACLE: DARK_GRAY,
 }
 
-# --- Map resource type to display info ---
+# Map resource type to display info
 RESOURCE_INFO = {
-    RESOURCE_FOOD: {'color': YELLOW, 'name': 'Food Bush', 'block_walk': False},
-    RESOURCE_WOOD: {'color': BROWN, 'name': 'Tree', 'block_walk': True}, # Trees block walk
-    RESOURCE_STONE: {'color': GRAY, 'name': 'Rock', 'block_walk': True}, # Rocks block walk
-    RESOURCE_WORKBENCH: {'color': ORANGE, 'name': 'Workbench', 'block_walk': False} # Workbench usually doesn't block
+    RESOURCE_FOOD: {'color': YELLOW, 'name': 'Food Bush', 'block_walk': False, 'max_quantity': 5, 'regen': 0.01},
+    RESOURCE_WOOD: {'color': BROWN, 'name': 'Tree', 'block_walk': True, 'max_quantity': 8, 'regen': 0.002}, # Trees block walk, slower regen
+    RESOURCE_STONE: {'color': GRAY, 'name': 'Rock', 'block_walk': True, 'max_quantity': 10, 'regen': 0.001}, # Rocks block walk, very slow regen
+    RESOURCE_WORKBENCH: {'color': ORANGE, 'name': 'Workbench', 'block_walk': False, 'max_quantity': 1, 'regen': 0} # Workbench doesn't block, no regen
     # Water is handled by terrain
 }
 
 # Pathfinding Settings
-MAX_PATHFINDING_ITERATIONS = 2000 # Limit A* search steps for performance
+MAX_PATHFINDING_ITERATIONS = 3000 # Increased limit slightly
 
-# Social Settings (Phase 4+)
-SIGNAL_RANGE = 15
-HELPING_RELATIONSHIP_THRESHOLD = -0.2 # Minimum relationship to offer help
-TEACHING_RELATIONSHIP_THRESHOLD = 0.1 # Minimum relationship to offer teaching
-LEARNING_RELATIONSHIP_THRESHOLD = -0.1 # Minimum relationship to accept learning
-PASSIVE_LEARN_CHANCE = 0.6 # Chance to learn recipe from observed crafting signal
+# Social Settings
+SIGNAL_RANGE = 18 # Increased broadcast range
+HELPING_RELATIONSHIP_THRESHOLD = -0.3 # Minimum relationship to offer help (slightly more lenient)
+HELPING_INTERACTION_RADIUS = 2     # Max Chebyshev distance to perform help action
+TEACHING_RELATIONSHIP_THRESHOLD = 0.0 # Minimum relationship to offer teaching (neutral or positive)
+LEARNING_RELATIONSHIP_THRESHOLD = -0.2 # Minimum relationship to accept learning (not strongly disliked)
+PASSIVE_LEARN_CHANCE = 0.5 # Base chance to learn recipe from observed crafting signal (modified by distance, relationship)
