@@ -4,6 +4,8 @@ import math
 import config as cfg
 from pathfinding_utils import find_path
 from knowledge import KnowledgeSystem
+from world import Resource # Phase 3 check for workbench instance
+
 # Note: GridNode is used internally by pathfinding, no need to import explicitly usually
 
 _agent_id_counter = 0
@@ -25,15 +27,10 @@ class Agent:
         self.thirst = 0 # Starts not thirsty
 
         # State & Action
-        self.current_action = None # e.g., "Moving", "Eating", "Resting"
-        self.action_target = None # Dict containing target info: {'type': 'location'/'agent', 'goal': (x,y)/id, 'stand':(x,y)}
-        self.current_path = [] # List of GridNode objects for movement from pathfinding library
+        self.current_action = None # e.g., "Moving", "Eating", "Resting", "Craft:CrudeAxe"
+        self.action_target = None # Dict containing target info: {'type': 'location'/'agent'/'craft', 'goal': (x,y)/id/recipe, 'stand':(x,y), 'requires_workbench': bool}
+        self.current_path = [] # List of GridNode objects for movement
         self.action_timer = 0.0 # Time spent on current action segment (e.g., gathering)
-
-        # --- Phase 1 Additions ---
-        # Simple memory replaced by knowledge system
-        # self.last_known_water_pos = None
-        # self.last_known_food_pos = None
 
         # --- Phase 2 Additions ---
         self.inventory = {} # item_name: count
@@ -41,12 +38,10 @@ class Agent:
             'GatherWood': cfg.INITIAL_SKILL_LEVEL,
             'GatherStone': cfg.INITIAL_SKILL_LEVEL,
             'BasicCrafting': cfg.INITIAL_SKILL_LEVEL,
-            # Add more skills (e.g., specific crafting, social skills)
         }
 
         # --- Phase 3 Additions ---
         self.knowledge = KnowledgeSystem(self.id) # More structured knowledge
-        # Add attributes like Curiosity, Intelligence? (Could influence invention chance/utility)
 
         # --- Phase 4 Additions ---
         self.sociability = random.uniform(0.1, 0.9) # Example personality trait
@@ -64,10 +59,14 @@ class Agent:
             return # Agent is dead, no further updates
 
         # 3. Process Environment Signals (Phase 4+)
-        self._process_signals() # Handle any signal received last tick
+        self._process_signals(agents, social_manager) # Pass args if needed by reactions
+
+        # If a signal reaction changed the action, skip action execution this tick
+        if self.pending_signal: # Check if signal processing set a new action that needs setup next tick
+             pass # Let the new action start next update loop
 
         # 4. Execute Current Action or Choose New One
-        if self.current_action:
+        elif self.current_action:
             action_complete = self._perform_action(dt_sim_seconds, agents, social_manager)
             if action_complete:
                 self._complete_action() # Cleanup and allow choosing new action next tick
@@ -94,7 +93,7 @@ class Agent:
         health_drain = 0
         if self.hunger >= cfg.MAX_HUNGER * 0.95: health_drain += 0.8
         if self.thirst >= cfg.MAX_THIRST * 0.95: health_drain += 1.0 # Thirst more critical
-        if self.energy <= 0: health_drain += 0.5
+        if self.energy <= 0 and self.current_action != "Rest": health_drain += 0.5 # Drain health if out of energy AND not resting
         self.health -= health_drain * dt_sim_seconds
 
         # Clamp health
@@ -102,500 +101,699 @@ class Agent:
 
 
     def _choose_action(self, agents, social_manager):
-        """ Basic Utility AI Decision Making """
+        """ Utility AI Decision Making - Expanded for Phases 2, 3, 4 """
         utilities = {}
 
         # --- Calculate Utility for Basic Needs ---
-        # Use a curve to make needs more urgent as they approach maximum
-        utilities['SatisfyThirst'] = (self.thirst / cfg.MAX_THIRST)**2 # Squared makes it grow faster near max
+        utilities['SatisfyThirst'] = (self.thirst / cfg.MAX_THIRST)**2
         utilities['SatisfyHunger'] = (self.hunger / cfg.MAX_HUNGER)**2
-        # Utility to rest increases as energy decreases, but only consider if below threshold
         energy_deficit = (cfg.MAX_ENERGY - self.energy) / cfg.MAX_ENERGY
         utilities['Rest'] = energy_deficit**2 if self.energy < cfg.MAX_ENERGY * 0.7 else 0
 
         # --- Phase 2+: Resource Gathering ---
-        # Utility based on how much is needed vs a goal amount
         has_axe = self.inventory.get('CrudeAxe', 0) > 0
-        wood_goal = 10
-        wood_need_factor = max(0, 1 - (self.inventory.get('Wood', 0) / wood_goal))
-        utilities['GatherWood'] = wood_need_factor * 0.3 * (1.5 if has_axe else 0.5) # Base utility 0.3, scaled by need and tool
+        has_pick = self.inventory.get('StonePick', 0) > 0
+        current_wood = self.inventory.get('Wood', 0)
+        current_stone = self.inventory.get('Stone', 0)
+        inventory_full = sum(self.inventory.values()) >= cfg.INVENTORY_CAPACITY
 
-        stone_goal = 5
-        stone_need_factor = max(0, 1 - (self.inventory.get('Stone', 0) / stone_goal))
-        utilities['GatherStone'] = stone_need_factor * 0.3
+        # Gather Wood Utility: Higher if low on wood, boosted by axe, zero if inventory full
+        if not inventory_full or current_wood < 5: # Allow gathering if specifically low on wood
+            wood_goal = 10
+            wood_need_factor = max(0, min(1, (wood_goal - current_wood) / wood_goal)) # Need decreases as goal reached
+            wood_gather_utility = wood_need_factor * 0.4 # Base utility
+            if has_axe: wood_gather_utility *= 1.8 # Axe helps a lot
+            if inventory_full: wood_gather_utility *= 0.1 # Much lower priority if generally full
+            utilities['GatherWood'] = wood_gather_utility
 
-        # --- Phase 2+: Crafting ---
-        # Check known recipes, ingredients, skills
+        # Gather Stone Utility: Similar logic, boosted by pickaxe
+        if not inventory_full or current_stone < 5:
+            stone_goal = 5
+            stone_need_factor = max(0, min(1, (stone_goal - current_stone) / stone_goal))
+            stone_gather_utility = stone_need_factor * 0.35
+            if has_pick: stone_gather_utility *= 1.8
+            if inventory_full: stone_gather_utility *= 0.1
+            utilities['GatherStone'] = stone_gather_utility
+
+        # --- Phase 2+/3+: Crafting ---
         best_craft_utility = 0
         best_craft_recipe = None
-        for recipe_name in self.knowledge.known_recipes:
-            details = cfg.RECIPES.get(recipe_name)
-            if details and self._has_ingredients(details['ingredients']) and self._has_skill_for(details):
-                # Base utility for being able to craft something potentially useful
-                utility = 0.2
-                # Specific goal-based boosts:
-                if recipe_name == 'CrudeAxe' and not has_axe:
-                    utility = 0.7 # High desire for first tool
-                # Add more boosts (e.g., need shelter materials -> craft shelter components)
+        for recipe_name in cfg.RECIPES.keys(): # Check all potential recipes
+            details = cfg.RECIPES[recipe_name]
+            # Feasibility checks: Have ingredients? Have skill? Recipe Requires Workbench? Workbench available?
+            has_ings = self._has_ingredients(details['ingredients'])
+            has_skill = self._has_skill_for(details)
+            requires_wb = details.get('workbench', False)
 
-                if utility > best_craft_utility:
-                    best_craft_utility = utility
-                    best_craft_recipe = recipe_name
+            # Preliminary check - can we even craft this?
+            if not (has_ings and has_skill):
+                 continue
+
+            # Check workbench proximity IF required (more detailed check in _check_action_feasibility)
+            needs_wb_check = requires_wb # Only check if recipe needs it
+            if needs_wb_check:
+                 _, wb_stand_pos, _ = self.world.find_nearest_resource(self.x, self.y, cfg.RESOURCE_WORKBENCH, max_dist=5) # Quick check nearby
+                 if wb_stand_pos is None: # No WB nearby -> cannot craft this now
+                     continue
+
+            # Calculate utility IF feasible
+            utility = 0.0
+            knows_recipe = self.knowledge.knows_recipe(recipe_name)
+
+            # Base utility: Higher if recipe is known, lower if just potentially craftable
+            utility += 0.1 if knows_recipe else 0.01
+
+            # Goal-based boosts:
+            if recipe_name == 'CrudeAxe' and not has_axe: utility = 0.7 # High desire for first tool
+            elif recipe_name == 'StonePick' and not has_pick and current_stone < stone_goal: utility = 0.65 # High desire for pick if needed
+            elif recipe_name == 'Workbench' and current_wood >= 4 and current_stone >= 2 and not self._is_workbench_nearby(distance=5):
+                 # Utility to build a workbench if none is nearby and have materials
+                 utility = 0.6
+            elif recipe_name == 'SmallShelter' and self.inventory.get('SmallShelter', 0) == 0:
+                 # Utility to build shelter (maybe higher at night?)
+                 utility = 0.5
+
+            # Only consider recipes agent KNOWS unless trying to invent
+            if knows_recipe and utility > best_craft_utility:
+                best_craft_utility = utility
+                best_craft_recipe = recipe_name
+
         if best_craft_recipe:
-            utilities['Craft:' + best_craft_recipe] = best_craft_utility # Unique key per recipe
+            utilities['Craft:' + best_craft_recipe] = best_craft_utility
 
         # --- Phase 3+: Invention ---
-        # Utility: Consider if needs are met (low need urgency) and have items to combine
+        # Utility: Consider if needs are met, have items, and AT a workbench
         needs_met_factor = max(0, 1 - max(utilities.get('SatisfyThirst',0), utilities.get('SatisfyHunger',0), utilities.get('Rest',0)))
-        can_invent = len(self.inventory) >= 2 # Simplistic check
-        # Phase 3: Add workbench requirement check here if needed
-        if can_invent:
+        can_invent = len(self.inventory) >= 2 # Simplistic check: has at least 2 item types/counts
+        is_at_workbench = self._is_at_workbench() # Check if currently at a workbench
+
+        if can_invent and is_at_workbench: # Invention requires workbench
             # Base utility low, increases if not busy with basic needs, plus randomness/curiosity
-            utilities['Invent'] = 0.1 * needs_met_factor * random.uniform(0.8, 1.2)
+            # Reduce utility slightly if already know many recipes
+            known_recipe_count = len(self.knowledge.known_recipes)
+            invention_utility = 0.15 * needs_met_factor * random.uniform(0.8, 1.2) * max(0.1, 1 - known_recipe_count / len(cfg.RECIPES))
+            utilities['Invent'] = invention_utility
+        elif can_invent and not is_at_workbench:
+             # Add utility to GO TO a workbench to invent
+             _, wb_stand_pos, _ = self.world.find_nearest_resource(self.x, self.y, cfg.RESOURCE_WORKBENCH)
+             if wb_stand_pos: # If a workbench exists somewhere
+                  goto_wb_utility = 0.1 * needs_met_factor # Low utility just to move there
+                  # Action name distinguishes it from crafting AT workbench
+                  utilities['GoToWorkbench:Invent'] = goto_wb_utility
+
 
         # --- Phase 4+: Social Actions ---
-        # Utility for Helping: Find someone nearby who needs help
         target_to_help = self._find_agent_to_help(agents)
         if target_to_help:
-             # Utility depends on target's need severity, agent's sociability, and relationship
              relationship_mod = (1 + self.knowledge.get_relationship(target_to_help.id)) / 2 # Scale 0 to 1
-             help_need = max(target_to_help.hunger, target_to_help.thirst) # Example: help most urgent need
-             help_utility = 0.6 * self.sociability * relationship_mod * (help_need / cfg.MAX_HUNGER) # Base 0.6
-             utilities['Help:'+str(target_to_help.id)] = help_utility
+             # Determine primary need of target agent
+             help_need = 0
+             if target_to_help.hunger > target_to_help.thirst and target_to_help.hunger > cfg.MAX_HUNGER * 0.7:
+                 help_need = (target_to_help.hunger / cfg.MAX_HUNGER)**2
+             elif target_to_help.thirst > cfg.MAX_THIRST * 0.7:
+                 help_need = (target_to_help.thirst / cfg.MAX_THIRST)**2
 
-        # Placeholder: Utility for Teaching/Learning - requires finding partners/checking skills
+             if help_need > 0:
+                 help_utility = 0.6 * self.sociability * relationship_mod * help_need # Base 0.6
+                 utilities['Help:'+str(target_to_help.id)] = help_utility
+
+        # TODO: Add utility for Teaching (find agent who needs skill, check relationship etc.)
 
         # --- Default/Fallback Action ---
-        utilities['Wander'] = 0.05 # Very low base utility, chosen if nothing else is pressing
+        utilities['Wander'] = 0.05 # Very low base utility
 
         # --- Select Best Action ---
         best_action = None
-        max_utility = -1 # Find the absolute highest utility
+        max_utility = -1
 
-        if not utilities: # Should not happen with Wander included
+        if not utilities:
              self.current_action = "Idle"
              print(f"Agent {self.id} has no utilities, becoming Idle.")
              return
 
-        # Sort actions by utility, highest first
         sorted_utilities = sorted(utilities.items(), key=lambda item: item[1], reverse=True)
-        # print(f"Agent {self.id} Utilities: {[(a, f'{u:.2f}') for a, u in sorted_utilities]}") # Debug
+        # print(f"Agent {self.id} Utilities: {[(a, f'{u:.2f}') for a, u in sorted_utilities]}") # Debug spammy
 
-        # Iterate through sorted actions and pick the first one that is feasible
         for action, utility in sorted_utilities:
-            # Only consider actions with positive utility, meeting a minimum threshold can also be added here
-            if utility <= 0: # or utility < cfg.UTILITY_THRESHOLD:
+            if utility <= cfg.UTILITY_THRESHOLD and action != 'Wander': # Allow Wander even below threshold if nothing else works
                 continue
 
-            feasible = self._check_action_feasibility(action, agents) # Pass agents if needed for checks
+            feasible, target_data = self._check_action_feasibility(action, agents) # Get feasibility AND target data
             if feasible:
                 best_action = action
                 max_utility = utility
-                break # Found the highest priority feasible action
+                # Store target data gathered during feasibility check
+                self.action_target = target_data
+                break
 
-        # If no action is feasible (e.g., trapped, no resources anywhere), check Wander or become Idle
         if not best_action:
-            if self._check_action_feasibility('Wander', agents): # Check if wandering is possible
+            feasible, target_data = self._check_action_feasibility('Wander', agents)
+            if feasible:
                 best_action = 'Wander'
                 max_utility = utilities.get('Wander', 0.05)
-                print(f"Agent {self.id}: No primary action feasible, choosing Wander.")
+                self.action_target = target_data
+                # print(f"Agent {self.id}: No primary action feasible/above threshold, choosing Wander.")
             else:
-                # Truly stuck or nothing to do
                 best_action = "Idle"
                 max_utility = 0
+                self.action_target = None # Ensure target is clear for Idle
                 print(f"Agent {self.id} becoming Idle (no feasible action, including Wander). Needs(H,T,E): ({self.hunger:.0f},{self.thirst:.0f},{self.energy:.0f})")
 
 
         # --- Initiate Action ---
-        if self.current_action == best_action and best_action == "Idle": return # Don't restart idle
+        if self.current_action == best_action and best_action == "Idle": return
+
+        print(f"Agent {self.id} choosing action: {best_action} (Utility: {max_utility:.2f}) Needs(H,T,E): ({self.hunger:.0f},{self.thirst:.0f},{self.energy:.0f}) Inv: {sum(self.inventory.values())}")
 
         self.current_action = best_action
-        self.action_target = None # Reset target
         self.current_path = [] # Reset path
         self.action_timer = 0.0 # Reset action timer
 
-        if best_action == "Idle": return # No further setup for Idle
+        if best_action == "Idle":
+             self.action_target = None # Explicitly clear target for Idle
+             return
 
-        print(f"Agent {self.id} choosing action: {best_action} (Utility: {max_utility:.2f}) Needs(H,T,E): ({self.hunger:.0f},{self.thirst:.0f},{self.energy:.0f})")
-
-        # Set target and plan path based on action
+        # --- Path Planning based on action_target ---
         target_setup_success = False
         try:
-            if best_action == 'SatisfyThirst':
-                # Find water tile (goal) and adjacent land tile (stand)
-                target_pos, stand_pos, dist = self.world.find_nearest_resource(self.x, self.y, cfg.RESOURCE_WATER)
-                if stand_pos: # Check if a standing position was found
-                    self.action_target = {'type': 'location', 'goal': target_pos, 'stand': stand_pos}
-                    self.current_path = self._plan_path(stand_pos)
-                    target_setup_success = bool(self.current_path or (self.x, self.y) == stand_pos) # Success if path found or already there
-            elif best_action == 'SatisfyHunger':
-                target_pos, stand_pos, dist = self.world.find_nearest_resource(self.x, self.y, cfg.RESOURCE_FOOD)
-                if stand_pos:
-                    self.action_target = {'type': 'location', 'goal': target_pos, 'stand': stand_pos}
-                    self.current_path = self._plan_path(stand_pos)
-                    self.knowledge.add_resource_location(cfg.RESOURCE_FOOD, target_pos[0], target_pos[1]) # Remember location
-                    target_setup_success = bool(self.current_path or (self.x, self.y) == stand_pos)
-            elif best_action == 'GatherWood':
-                 target_pos, stand_pos, dist = self.world.find_nearest_resource(self.x, self.y, cfg.RESOURCE_WOOD)
-                 if stand_pos:
-                     self.action_target = {'type': 'location', 'goal': target_pos, 'stand': stand_pos}
-                     self.current_path = self._plan_path(stand_pos)
-                     self.knowledge.add_resource_location(cfg.RESOURCE_WOOD, target_pos[0], target_pos[1])
-                     target_setup_success = bool(self.current_path or (self.x, self.y) == stand_pos)
-            elif best_action == 'GatherStone':
-                 target_pos, stand_pos, dist = self.world.find_nearest_resource(self.x, self.y, cfg.RESOURCE_STONE)
-                 if stand_pos:
-                     self.action_target = {'type': 'location', 'goal': target_pos, 'stand': stand_pos}
-                     self.current_path = self._plan_path(stand_pos)
-                     self.knowledge.add_resource_location(cfg.RESOURCE_STONE, target_pos[0], target_pos[1])
-                     target_setup_success = bool(self.current_path or (self.x, self.y) == stand_pos)
-            elif best_action.startswith('Craft:'):
-                 # Assumes crafting happens at current location for now
-                 self.action_target = {'type': 'craft', 'recipe': best_action.split(':')[1]}
-                 # Phase 3: If recipe requires workbench, find nearest and path to it here.
-                 target_setup_success = True # No movement needed initially
-            elif best_action == 'Invent':
-                 # Assumes inventing happens at current location for now
-                 self.action_target = {'type': 'invent'}
-                 # Phase 3: If requires workbench, find nearest and path to it here.
-                 target_setup_success = True # No movement needed initially
-            elif best_action.startswith('Help:'):
-                target_id = int(best_action.split(':')[1])
-                target_agent = next((a for a in agents if a.id == target_id), None)
-                if target_agent:
-                    # Path to a nearby tile to the target agent
-                    stand_pos = self._find_adjacent_walkable(target_agent.x, target_agent.y)
-                    if stand_pos:
-                        self.action_target = {'type': 'agent', 'goal': target_agent.id, 'stand': stand_pos}
-                        self.current_path = self._plan_path(stand_pos)
-                        target_setup_success = bool(self.current_path or (self.x, self.y) == stand_pos)
-                    else: print(f"Agent {self.id}: Cannot find spot near target agent {target_id} for Help.")
-            elif best_action == 'Rest':
-                 self.action_target = {'type': 'rest'}
-                 target_setup_success = True # No movement needed
-            elif best_action == 'Wander':
-                wander_target = None
-                for _ in range(10): # Try finding a random walkable target nearby
-                     wx = self.x + random.randint(-cfg.WANDER_RADIUS, cfg.WANDER_RADIUS)
-                     wy = self.y + random.randint(-cfg.WANDER_RADIUS, cfg.WANDER_RADIUS)
-                     # Ensure within bounds and walkable
-                     if 0 <= wx < self.world.width and 0 <= wy < self.world.height and self.world.walkability_matrix[wy, wx] == 1:
-                          wander_target = (wx, wy)
-                          break
-                if wander_target:
-                    self.action_target = {'type': 'wander', 'stand': wander_target}
-                    self.current_path = self._plan_path(wander_target)
-                    # Success if path found or already at target (unlikely for wander)
-                    target_setup_success = bool(self.current_path or (self.x, self.y) == wander_target)
+            stand_pos = self.action_target.get('stand')
+
+            if stand_pos:
+                # Check if already at the stand position
+                if (self.x, self.y) == stand_pos:
+                    target_setup_success = True # No path needed
+                    self.current_path = []
                 else:
-                    print(f"Agent {self.id}: Could not find a wander target nearby.")
-                    target_setup_success = False # Failed to find target
+                    # Plan path to the stand position, avoiding other agents
+                    self.current_path = self._plan_path(stand_pos, agents)
+                    if self.current_path is not None: # Check if pathfinding returned a list (even empty) vs None (error)
+                         if not self.current_path and (self.x, self.y) != stand_pos:
+                              # Pathfinding returned empty list but not at target -> unreachable?
+                              target_setup_success = False
+                              print(f"Agent {self.id}: Path to {stand_pos} for {best_action} failed (empty path, not at target).")
+                         else:
+                              target_setup_success = True # Path found or already there
+                    else:
+                         # Pathfinding failed (returned None)
+                         target_setup_success = False
+                         print(f"Agent {self.id}: Path to {stand_pos} for {best_action} failed (pathfinder error).")
+
+            elif best_action == 'Rest' or best_action == 'Invent': # Actions at current location initially
+                # Invent might require moving to workbench later if GoToWorkbench chosen
+                 target_setup_success = True
+            else:
+                 # Action doesn't have a 'stand' position defined in feasibility check? Error state.
+                 print(f"Agent {self.id}: Action {best_action} selected but no 'stand' position in target data.")
+                 target_setup_success = False
+
 
         except Exception as e:
-             print(f"Error during action setup for {best_action}: {e}")
+             print(f"Error during action path planning for {best_action}: {e}")
+             import traceback
+             traceback.print_exc()
              target_setup_success = False
 
 
-        # If setting up the target/path failed, clear the action -> Idle or re-evaluate next tick
+        # If setting up the target/path failed, revert to Idle
         if not target_setup_success:
-             print(f"Agent {self.id}: Failed to initiate action {best_action}. Clearing action.")
-             self.current_action = "Idle" # Revert to Idle state
+             print(f"Agent {self.id}: Failed to initiate action {best_action}. Reverting to Idle.")
+             self.current_action = "Idle"
              self.action_target = None
              self.current_path = []
 
 
     def _check_action_feasibility(self, action_name, agents):
-        """ Checks if resources/targets exist and path might be possible """
-        # Note: This is a preliminary check. Pathfinding might still fail later.
+        """
+        Checks if an action is possible and returns (bool feasible, dict target_data).
+        Target data includes 'type', 'goal', 'stand', etc. needed to execute action.
+        """
+        target_data = {'type': action_name.split(':')[0]} # Base type
+
         if action_name == 'SatisfyThirst':
-            _, stand_pos, _ = self.world.find_nearest_resource(self.x, self.y, cfg.RESOURCE_WATER)
-            return stand_pos is not None
+            goal_pos, stand_pos, dist = self.world.find_nearest_resource(self.x, self.y, cfg.RESOURCE_WATER)
+            if stand_pos:
+                target_data.update({'goal': goal_pos, 'stand': stand_pos})
+                return True, target_data
+            return False, None
+
         elif action_name == 'SatisfyHunger':
-            _, stand_pos, _ = self.world.find_nearest_resource(self.x, self.y, cfg.RESOURCE_FOOD)
-            return stand_pos is not None
+            goal_pos, stand_pos, dist = self.world.find_nearest_resource(self.x, self.y, cfg.RESOURCE_FOOD)
+            if stand_pos:
+                target_data.update({'goal': goal_pos, 'stand': stand_pos})
+                self.knowledge.add_resource_location(cfg.RESOURCE_FOOD, goal_pos[0], goal_pos[1]) # Remember location
+                return True, target_data
+            return False, None
+
         elif action_name == 'GatherWood':
-             _, stand_pos, _ = self.world.find_nearest_resource(self.x, self.y, cfg.RESOURCE_WOOD)
-             return stand_pos is not None
+             goal_pos, stand_pos, dist = self.world.find_nearest_resource(self.x, self.y, cfg.RESOURCE_WOOD)
+             if stand_pos:
+                 target_data.update({'goal': goal_pos, 'stand': stand_pos})
+                 self.knowledge.add_resource_location(cfg.RESOURCE_WOOD, goal_pos[0], goal_pos[1])
+                 return True, target_data
+             return False, None
+
         elif action_name == 'GatherStone':
-             _, stand_pos, _ = self.world.find_nearest_resource(self.x, self.y, cfg.RESOURCE_STONE)
-             return stand_pos is not None
+             goal_pos, stand_pos, dist = self.world.find_nearest_resource(self.x, self.y, cfg.RESOURCE_STONE)
+             if stand_pos:
+                 target_data.update({'goal': goal_pos, 'stand': stand_pos})
+                 self.knowledge.add_resource_location(cfg.RESOURCE_STONE, goal_pos[0], goal_pos[1])
+                 return True, target_data
+             return False, None
+
         elif action_name.startswith('Craft:'):
              recipe_name = action_name.split(':')[1]
              details = cfg.RECIPES.get(recipe_name)
-             # Phase 3+: Add check for workbench nearby if details['workbench'] is True
-             return details and self.knowledge.knows_recipe(recipe_name) and self._has_ingredients(details['ingredients']) and self._has_skill_for(details)
+             if not details: return False, None
+
+             requires_wb = details.get('workbench', False)
+             target_data.update({'recipe': recipe_name, 'requires_workbench': requires_wb})
+
+             # Check ingredients, skill, knowledge
+             if not (self.knowledge.knows_recipe(recipe_name) and
+                     self._has_ingredients(details['ingredients']) and
+                     self._has_skill_for(details)):
+                 return False, None
+
+             # Check workbench requirement
+             if requires_wb:
+                 # Is agent already at a workbench?
+                 if self._is_at_workbench():
+                      target_data['stand'] = (self.x, self.y) # Stand at current location (workbench)
+                      target_data['goal'] = (self.x, self.y) # Goal is also workbench location
+                      return True, target_data
+                 else:
+                      # Find nearest workbench and set stand/goal to go there
+                      wb_goal_pos, wb_stand_pos, dist = self.world.find_nearest_resource(self.x, self.y, cfg.RESOURCE_WORKBENCH)
+                      if wb_stand_pos:
+                          target_data['goal'] = wb_goal_pos # The workbench itself
+                          target_data['stand'] = wb_stand_pos # Where to stand to use it
+                          # Action becomes moving TO the workbench first
+                          return True, target_data
+                      else:
+                          return False, None # No workbench available
+             else: # No workbench needed, craft at current location
+                 target_data['stand'] = (self.x, self.y)
+                 target_data['goal'] = (self.x, self.y)
+                 return True, target_data
+
         elif action_name == 'Invent':
-             # Phase 3+: Add check for workbench nearby?
-             return len(self.inventory) >= 2
+             # Requires being AT a workbench
+             target_data['requires_workbench'] = True
+             if len(self.inventory) >= 2 and self._is_at_workbench():
+                 target_data['stand'] = (self.x, self.y)
+                 target_data['goal'] = (self.x, self.y)
+                 return True, target_data
+             return False, None
+
+        elif action_name == 'GoToWorkbench:Invent':
+             # Feasibility: Inventory has items, and a workbench exists somewhere
+             if len(self.inventory) >= 2:
+                  wb_goal_pos, wb_stand_pos, dist = self.world.find_nearest_resource(self.x, self.y, cfg.RESOURCE_WORKBENCH)
+                  if wb_stand_pos:
+                      target_data['goal'] = wb_goal_pos
+                      target_data['stand'] = wb_stand_pos
+                      return True, target_data
+             return False, None
+
+
         elif action_name.startswith('Help:'):
-             # Feasibility (target exists and needs help) checked during utility calculation.
-             # Check if we have the means (e.g., food)
              target_id = int(action_name.split(':')[1])
-             target_agent = next((a for a in agents if a.id == target_id), None)
-             if not target_agent: return False # Target doesn't exist anymore
-             if target_agent.hunger > cfg.MAX_HUNGER * 0.7 and self.inventory.get('Food', 0) > 0: return True
-             # Add checks for other types of help (water, etc.)
-             return False # Cannot help this target currently
+             target_agent = next((a for a in agents if a.id == target_id and a.health > 0), None)
+             if not target_agent: return False, None # Target gone
+
+             # Check if CAN help (e.g., have food if target is hungry)
+             can_help = False
+             if target_agent.hunger > cfg.MAX_HUNGER * 0.75 and self.inventory.get('Food', 0) >= 1:
+                 can_help = True
+             # Add check for water if carrying mechanism exists
+
+             if not can_help: return False, None
+
+             # Find a spot near the target to stand
+             stand_pos = self._find_adjacent_walkable(target_agent.x, target_agent.y)
+             if stand_pos:
+                  target_data.update({'goal': target_id, 'stand': stand_pos})
+                  return True, target_data
+             return False, None # Cannot find spot near target
+
         elif action_name == 'Wander':
-             # Check if *any* adjacent tile is walkable? Crude check for being trapped.
-             for dx, dy in [(0,1), (0,-1), (1,0), (-1,0)]:
-                  nx, ny = self.x + dx, self.y + dy
-                  if 0 <= nx < self.world.width and 0 <= ny < self.world.height and self.world.walkability_matrix[ny, nx] == 1:
-                      return True
-             return False # Trapped
+             # Find a random walkable target nearby
+             wander_target = None
+             for _ in range(10):
+                  wx = self.x + random.randint(-cfg.WANDER_RADIUS, cfg.WANDER_RADIUS)
+                  wy = self.y + random.randint(-cfg.WANDER_RADIUS, cfg.WANDER_RADIUS)
+                  if 0 <= wx < self.world.width and 0 <= wy < self.world.height and self.world.walkability_matrix[wy, wx] == 1:
+                       # Ensure not wandering into water/obstacle inadvertently
+                       if self.world.terrain_map[wy,wx] == cfg.TERRAIN_GROUND:
+                            wander_target = (wx, wy)
+                            break
+             if wander_target:
+                 target_data['stand'] = wander_target # For wander, stand=goal
+                 target_data['goal'] = wander_target
+                 return True, target_data
+             else:
+                 # Check if *any* adjacent tile is walkable as a last resort (check if trapped)
+                 if self._find_adjacent_walkable(self.x, self.y):
+                      # Can move, but couldn't find random spot? Try wandering to adjacent.
+                      adj = self._find_adjacent_walkable(self.x, self.y)
+                      target_data['stand'] = adj
+                      target_data['goal'] = adj
+                      return True, target_data # Can at least move one step
+                 else:
+                      return False, None # Truly trapped
+
         elif action_name == "Idle":
-             return True # Idle is always feasible
+             return True, {'type': 'Idle'} # Idle is always feasible
+
         elif action_name == "Rest":
-             return True # Rest is always feasible (can rest anywhere for now)
+             target_data['stand'] = (self.x, self.y) # Rest at current location
+             return True, target_data
+
         # Unknown action
+        print(f"Warning: Feasibility check for unknown action '{action_name}'")
+        return False, None
+
+    def _is_workbench_nearby(self, distance=1):
+        """ Checks if the agent is within `distance` cells of a workbench. """
+        for dx in range(-distance, distance + 1):
+             for dy in range(-distance, distance + 1):
+                 if dx == 0 and dy == 0: continue # Skip self
+                 nx, ny = self.x + dx, self.y + dy
+                 resource = self.world.get_resource(nx, ny)
+                 if resource and resource.type == cfg.RESOURCE_WORKBENCH:
+                     return True
         return False
 
+    def _is_at_workbench(self):
+         """ Checks if the agent is standing ON or directly adjacent to a workbench resource tile """
+         # Check current tile (shouldn't happen if WB blocks walk, but check anyway)
+         res_here = self.world.get_resource(self.x, self.y)
+         if res_here and res_here.type == cfg.RESOURCE_WORKBENCH:
+              return True
+         # Check adjacent tiles
+         for dx, dy in [(0,1), (0,-1), (1,0), (-1,0)]:
+             nx, ny = self.x + dx, self.y + dy
+             res_adj = self.world.get_resource(nx, ny)
+             if res_adj and res_adj.type == cfg.RESOURCE_WORKBENCH:
+                 return True
+         return False
 
-    def _plan_path(self, target_pos):
-        """ Finds a path using A*, returns list of GridNode objects """
+
+    def _plan_path(self, target_pos, agents):
+        """ Finds path using A*, avoiding other agents. Returns list of GridNode or None. """
         start_pos = (self.x, self.y)
         if not target_pos or start_pos == target_pos:
             return [] # Already there or no target
 
-        # Ensure target is within bounds
         tx, ty = target_pos
         if not (0 <= tx < self.world.width and 0 <= ty < self.world.height):
             print(f"Agent {self.id}: Target {target_pos} is out of bounds.")
-            return []
+            return None # Indicate error
 
-        # Check walkability before calling pathfinder
-        if self.world.walkability_matrix[ty, tx] == 0:
-            # Target itself is not walkable, try finding adjacent walkable instead
-            adj_target = self._find_adjacent_walkable(tx, ty)
+        # Get temporary walkability matrix with other agents marked as obstacles
+        other_agent_positions = [(a.x, a.y) for a in agents if a != self]
+        temp_walkability = self.world.update_walkability(agent_positions=other_agent_positions)
+
+        # Check walkability of start/end on the temporary grid
+        if temp_walkability[start_pos[1], start_pos[0]] == 0:
+             print(f"Agent {self.id}: Starting position {start_pos} is blocked (possibly by another agent)!")
+             # Try finding adjacent walkable to start from? Complex. Fail for now.
+             return None
+        if temp_walkability[ty, tx] == 0:
+            adj_target = self._find_adjacent_walkable(tx, ty, temp_walkability) # Use temp matrix for check
             if not adj_target:
-                 print(f"Agent {self.id}: Target {target_pos} is unwalkable and no adjacent walkable found.")
-                 return []
-            # print(f"Agent {self.id}: Target {target_pos} unwalkable, rerouting to {adj_target}")
-            target_pos = adj_target
+                 print(f"Agent {self.id}: Target {target_pos} is unwalkable/blocked and no adjacent found.")
+                 return None # Indicate error
+            # print(f"Agent {self.id}: Target {target_pos} unwalkable/blocked, rerouting to adjacent {adj_target}")
+            target_pos = adj_target # Update target to the adjacent walkable spot
 
-        # If start pos is somehow unwalkable (shouldn't happen if agent moves correctly)
-        if self.world.walkability_matrix[start_pos[1], start_pos[0]] == 0:
-             print(f"Agent {self.id}: Starting position {start_pos} is unwalkable!")
-             # Try finding adjacent walkable to start from? Complex recovery. For now, fail path.
-             return []
+        # Call pathfinder with the temporary matrix
+        path_nodes = find_path(temp_walkability, start_pos, target_pos)
 
-
-        path_nodes = find_path(self.world.walkability_matrix, start_pos, target_pos)
-
-        # Debug path output
-        # path_coords = [ (n.x, n.y) for n in path_nodes] if path_nodes else "None"
-        # print(f"Agent {self.id} Path from {start_pos} to {target_pos}: {path_coords}")
-
-        return path_nodes
+        return path_nodes # Returns list of nodes, empty list if not found, None on error
 
 
     def _perform_action(self, dt_sim_seconds, agents, social_manager):
         """ Executes the current action step, returns True if completed """
         if not self.current_action or self.current_action == "Idle":
-             return True # Idle completes immediately (or action was cleared)
-
-        action_type = self.current_action.split(':')[0] # Get base action type
+             return True
 
         # --- 1. Movement Phase (if path exists) ---
         if self.current_path:
+            # Check if path is still valid (e.g., next step isn't blocked by another agent NOW)
+            # More robust check needed here if dynamic obstacles are critical.
+            # For now, assume path remains valid unless explicitly recalculated.
+
             target_node = self.current_path[0]
-            # --- CORRECTED ACCESS to GridNode attributes ---
-            target_x = target_node.x
-            target_y = target_node.y
+            target_x, target_y = target_node.x, target_node.y
 
-            # Simple grid movement: Move one cell per update tick towards the target node
-            move_dist = 1 # Assume moved one cell
+            # Check if next step is occupied *right now* by another agent
+            is_occupied = False
+            for agent in agents:
+                 if agent != self and agent.health > 0 and agent.x == target_x and agent.y == target_y:
+                      is_occupied = True
+                      break
 
-            # Update position (teleport to next cell in path)
+            if is_occupied:
+                # print(f"Agent {self.id}: Next step ({target_x},{target_y}) blocked by Agent {agent.id}. Recalculating path...")
+                # Path is blocked, try recalculating path to the original stand position
+                stand_pos = self.action_target.get('stand')
+                if stand_pos:
+                     new_path = self._plan_path(stand_pos, agents)
+                     if new_path is not None and new_path: # Successfully recalculated
+                          self.current_path = new_path
+                          # Proceed with the first step of the *new* path next tick
+                          return False
+                     else: # Recalculation failed or yielded empty path immediately
+                          print(f"Agent {self.id}: Failed to recalculate path around obstacle. Completing action.")
+                          self._complete_action() # Give up on the action
+                          return True
+                else: # No stand_pos? Should not happen if action was set up correctly
+                     print(f"Agent {self.id}: Path blocked, but no stand_pos to replan to. Completing action.")
+                     self._complete_action()
+                     return True
+
+            # --- If next step is clear, move ---
+            move_dist = 1 # Simple grid movement
             self.x = target_x
             self.y = target_y
-            self.energy -= cfg.MOVE_ENERGY_COST * move_dist # Apply energy cost
+            self.energy -= cfg.MOVE_ENERGY_COST * move_dist
 
-            # Remove the reached node from the path
             self.current_path.pop(0)
-            # --- END CORRECTION ---
-
-            # Action is not complete yet, still moving (unless path is now empty)
-            return False
+            return False # Still moving (or just finished moving this tick)
 
         # --- 2. Action Execution Phase (at target location, path is empty) ---
+        # Ensure agent is actually at the required standing position
+        expected_stand_pos = self.action_target.get('stand')
+        if expected_stand_pos and (self.x, self.y) != expected_stand_pos:
+            # Arrived somewhere, but not the intended spot (path might have been short-circuited or target moved?)
+            print(f"Agent {self.id}: Arrived at ({self.x},{self.y}) but expected stand {expected_stand_pos} for {self.current_action}. Action failed.")
+            return True # Fail the action
+
         self.action_timer += dt_sim_seconds
-        base_action_duration = 1.0 # Base seconds per action unit (can be modified by skill)
+        base_action_duration = 1.0 # Base seconds per action unit
 
         try:
-            # Check if action target is valid (e.g., resource still exists) before acting
-            if self.action_target and 'goal' in self.action_target:
-                 if self.action_target['type'] == 'location':
-                     goal_x, goal_y = self.action_target['goal']
-                     stand_x, stand_y = self.action_target['stand']
-                     # Ensure agent is at the standing position
-                     if self.x != stand_x or self.y != stand_y:
-                         print(f"Agent {self.id}: Misaligned for action {self.current_action} at ({self.x},{self.y}), expected stand at ({stand_x},{stand_y}). Completing action.")
-                         return True # Path ended but not at correct spot, fail action
-
-                 elif self.action_target['type'] == 'agent':
-                      target_id = self.action_target['goal']
-                      target_agent = next((a for a in agents if a.id == target_id and a.health > 0), None)
-                      if not target_agent:
-                           print(f"Agent {self.id}: Target agent {target_id} for action {self.current_action} not found. Completing action.")
-                           return True # Target agent gone
+            action_type = self.current_action.split(':')[0] # Get base action type like 'Craft', 'Gather'
 
             # --- Phase 1 Actions ---
             if self.current_action == 'SatisfyThirst':
-                target_x, target_y = self.action_target['goal'] # Water tile coords
-                # Perform drink (fast action)
+                # Water is infinite at the goal tile (water terrain)
                 action_duration = base_action_duration * 0.5
                 if self.action_timer >= action_duration:
                     self.thirst = max(0, self.thirst - cfg.DRINK_THIRST_REDUCTION)
-                    print(f"Agent {self.id} drank. Thirst: {self.thirst:.0f}")
+                    self.energy -= cfg.MOVE_ENERGY_COST * 0.1 # Small energy cost to drink
+                    # print(f"Agent {self.id} drank. Thirst: {self.thirst:.0f}")
                     return True # Drink action complete
                 else: return False # Still drinking
 
             elif self.current_action == 'SatisfyHunger':
-                target_x, target_y = self.action_target['goal'] # Food resource coords
-                resource = self.world.get_resource(target_x, target_y)
+                goal_pos = self.action_target['goal']
+                resource = self.world.get_resource(goal_pos[0], goal_pos[1])
                 if resource and resource.type == cfg.RESOURCE_FOOD and not resource.is_depleted():
                     action_duration = base_action_duration * 0.5
                     if self.action_timer >= action_duration:
-                        amount = self.world.consume_resource_at(target_x, target_y, 1)
+                        amount = self.world.consume_resource_at(goal_pos[0], goal_pos[1], 1)
                         if amount > 0:
                             self.hunger = max(0, self.hunger - cfg.EAT_HUNGER_REDUCTION)
-                            print(f"Agent {self.id} ate. Hunger: {self.hunger:.0f}")
-                        return True # Eating complete (even if resource depleted just now)
+                            self.energy -= cfg.MOVE_ENERGY_COST * 0.1 # Small energy cost to eat
+                            # print(f"Agent {self.id} ate. Hunger: {self.hunger:.0f}")
+                            # Food item disappears after eating? Or reduces quantity? Consume handles quantity.
+                        else: # Failed to consume (e.g., depleted exactly now)
+                            self.knowledge.remove_resource_location(cfg.RESOURCE_FOOD, goal_pos[0], goal_pos[1])
+                        return True # Eating attempt complete
                     else: return False # Still eating
                 else: # Resource disappeared or depleted before eating
-                    print(f"Agent {self.id} failed to eat at {(target_x, target_y)} - resource gone.")
-                    if cfg.RESOURCE_FOOD in self.knowledge.known_resource_locations: # Forget location
-                         if (target_x, target_y) in self.knowledge.known_resource_locations[cfg.RESOURCE_FOOD]:
-                             self.knowledge.known_resource_locations[cfg.RESOURCE_FOOD].remove((target_x, target_y))
+                    print(f"Agent {self.id} failed to eat at {goal_pos} - resource gone.")
+                    self.knowledge.remove_resource_location(cfg.RESOURCE_FOOD, goal_pos[0], goal_pos[1])
                     return True # Action failed/complete
 
             elif self.current_action == 'Rest':
-                # Resting continues until energy is full OR a critical need arises
                 high_thirst = self.thirst > cfg.MAX_THIRST * 0.9
                 high_hunger = self.hunger > cfg.MAX_HUNGER * 0.9
                 if self.energy >= cfg.MAX_ENERGY or high_thirst or high_hunger:
-                    print(f"Agent {self.id} finished resting. Energy: {self.energy:.0f}")
+                    # print(f"Agent {self.id} finished resting. Energy: {self.energy:.0f}")
                     return True # Stop resting
-                # Continue resting (energy gain happens in _update_needs)
-                return False
+                return False # Continue resting (energy gain in _update_needs)
 
             elif self.current_action == 'Wander':
-                # Wander completes once destination is reached (which means path is empty here)
+                # Wander completes once destination ('stand' pos) is reached (path is empty here)
                 return True
 
             # --- Phase 2 Actions ---
             elif self.current_action == 'GatherWood':
-                 target_x, target_y = self.action_target['goal']
-                 resource = self.world.get_resource(target_x, target_y)
+                 goal_pos = self.action_target['goal']
+                 resource = self.world.get_resource(goal_pos[0], goal_pos[1])
                  if resource and resource.type == cfg.RESOURCE_WOOD and not resource.is_depleted():
-                     action_duration = base_action_duration / self._get_skill_multiplier('GatherWood')
+                     tool_multiplier = 1.5 if self.inventory.get('CrudeAxe', 0) > 0 else 1.0
+                     action_duration = base_action_duration / (self._get_skill_multiplier('GatherWood') * tool_multiplier)
                      if self.action_timer >= action_duration:
-                         amount = self.world.consume_resource_at(target_x, target_y, 1)
+                         amount = self.world.consume_resource_at(goal_pos[0], goal_pos[1], 1)
                          if amount > 0:
                              self.inventory['Wood'] = self.inventory.get('Wood', 0) + amount
                              self.energy -= cfg.GATHER_ENERGY_COST
                              self.learn_skill('GatherWood')
-                             print(f"Agent {self.id} gathered Wood. Total: {self.inventory.get('Wood', 0)}. Skill: {self.skills.get('GatherWood',0):.1f}")
+                             # print(f"Agent {self.id} gathered Wood. Total: {self.inventory.get('Wood', 0)}. Skill: {self.skills.get('GatherWood',0):.1f}")
                              self.action_timer = 0 # Reset timer for next unit
-                             # Check stopping conditions
-                             inventory_full = sum(self.inventory.values()) >= 20 # Example limit
-                             if self.inventory.get('Wood', 0) >= 10 or inventory_full or self.energy < cfg.GATHER_ENERGY_COST * 2:
+
+                             inventory_full = sum(self.inventory.values()) >= cfg.INVENTORY_CAPACITY
+                             wood_goal = 10 # Local goal for this gathering session
+                             if self.inventory.get('Wood', 0) >= wood_goal or inventory_full or self.energy < cfg.GATHER_ENERGY_COST * 2 or resource.is_depleted():
+                                  if resource.is_depleted(): self.knowledge.remove_resource_location(cfg.RESOURCE_WOOD, goal_pos[0], goal_pos[1])
                                   return True # Stop gathering
                              else:
                                   return False # Continue gathering from this source
                          else: # Resource depleted during attempt
                               print(f"Agent {self.id} failed to gather wood (depleted during attempt).")
+                              self.knowledge.remove_resource_location(cfg.RESOURCE_WOOD, goal_pos[0], goal_pos[1])
                               return True
                      else: return False # Still gathering this unit
                  else: # Resource gone/depleted before starting
-                     print(f"Agent {self.id} failed to gather wood at {(target_x, target_y)} - resource gone.")
-                     if cfg.RESOURCE_WOOD in self.knowledge.known_resource_locations: # Forget location
-                         if (target_x, target_y) in self.knowledge.known_resource_locations[cfg.RESOURCE_WOOD]:
-                              self.knowledge.known_resource_locations[cfg.RESOURCE_WOOD].remove((target_x, target_y))
+                     print(f"Agent {self.id} failed to gather wood at {goal_pos} - resource gone.")
+                     self.knowledge.remove_resource_location(cfg.RESOURCE_WOOD, goal_pos[0], goal_pos[1])
                      return True
 
             elif self.current_action == 'GatherStone':
-                 target_x, target_y = self.action_target['goal']
-                 resource = self.world.get_resource(target_x, target_y)
+                 goal_pos = self.action_target['goal']
+                 resource = self.world.get_resource(goal_pos[0], goal_pos[1])
                  if resource and resource.type == cfg.RESOURCE_STONE and not resource.is_depleted():
-                     action_duration = base_action_duration / self._get_skill_multiplier('GatherStone')
+                     tool_multiplier = 1.5 if self.inventory.get('StonePick', 0) > 0 else 1.0
+                     action_duration = base_action_duration / (self._get_skill_multiplier('GatherStone') * tool_multiplier)
                      if self.action_timer >= action_duration:
-                         amount = self.world.consume_resource_at(target_x, target_y, 1)
+                         amount = self.world.consume_resource_at(goal_pos[0], goal_pos[1], 1)
                          if amount > 0:
                              self.inventory['Stone'] = self.inventory.get('Stone', 0) + amount
                              self.energy -= cfg.GATHER_ENERGY_COST
                              self.learn_skill('GatherStone')
-                             print(f"Agent {self.id} gathered Stone. Total: {self.inventory.get('Stone',0)}. Skill: {self.skills.get('GatherStone',0):.1f}")
+                             # print(f"Agent {self.id} gathered Stone. Total: {self.inventory.get('Stone',0)}. Skill: {self.skills.get('GatherStone',0):.1f}")
                              self.action_timer = 0
-                             inventory_full = sum(self.inventory.values()) >= 20
-                             if self.inventory.get('Stone', 0) >= 5 or inventory_full or self.energy < cfg.GATHER_ENERGY_COST * 2: return True
+
+                             inventory_full = sum(self.inventory.values()) >= cfg.INVENTORY_CAPACITY
+                             stone_goal = 5
+                             if self.inventory.get('Stone', 0) >= stone_goal or inventory_full or self.energy < cfg.GATHER_ENERGY_COST * 2 or resource.is_depleted():
+                                 if resource.is_depleted(): self.knowledge.remove_resource_location(cfg.RESOURCE_STONE, goal_pos[0], goal_pos[1])
+                                 return True
                              else: return False
                          else:
                              print(f"Agent {self.id} failed to gather stone (depleted during attempt).")
+                             self.knowledge.remove_resource_location(cfg.RESOURCE_STONE, goal_pos[0], goal_pos[1])
                              return True
                      else: return False
                  else:
-                     print(f"Agent {self.id} failed to gather stone at {(target_x, target_y)} - resource gone.")
-                     if cfg.RESOURCE_STONE in self.knowledge.known_resource_locations: # Forget location
-                         if (target_x, target_y) in self.knowledge.known_resource_locations[cfg.RESOURCE_STONE]:
-                              self.knowledge.known_resource_locations[cfg.RESOURCE_STONE].remove((target_x, target_y))
+                     print(f"Agent {self.id} failed to gather stone at {goal_pos} - resource gone.")
+                     self.knowledge.remove_resource_location(cfg.RESOURCE_STONE, goal_pos[0], goal_pos[1])
                      return True
 
             elif action_type == 'Craft':
-                 # Assumes crafting at current location
+                 # Check if workbench is required and if agent is at one
+                 requires_wb = self.action_target.get('requires_workbench', False)
+                 if requires_wb and not self._is_at_workbench():
+                      print(f"Agent {self.id} cannot craft {self.action_target['recipe']} - not at workbench.")
+                      # Maybe should have pathfound to workbench first? Logic error somewhere?
+                      # For now, just fail the action.
+                      return True
+
+                 # Perform crafting
                  recipe_name = self.action_target['recipe']
                  details = cfg.RECIPES[recipe_name]
-                 action_duration = base_action_duration * 2 / self._get_skill_multiplier(details['skill'])
+                 action_duration = base_action_duration * 2.5 / self._get_skill_multiplier(details['skill']) # Crafting takes longer
                  if self.action_timer >= action_duration:
                      if not self._has_ingredients(details['ingredients']): # Double-check ingredients
                          print(f"Agent {self.id} cannot craft {recipe_name} - missing ingredients now.")
                          return True # Action failed
+
                      # Consume ingredients
                      for item, count in details['ingredients'].items():
                          self.inventory[item] = self.inventory.get(item, 0) - count
                          if self.inventory[item] <= 0: del self.inventory[item]
-                     # Add result item
-                     self.inventory[recipe_name] = self.inventory.get(recipe_name, 0) + 1
+
+                     # Add result item OR place object in world
+                     if recipe_name == 'Workbench': # Special case: Place workbench
+                          # Find placeable spot nearby? For now, place at current agent location if possible
+                          if self.world.add_world_object(Resource(cfg.RESOURCE_WORKBENCH, self.x, self.y, quantity=1, max_quantity=1), self.x, self.y):
+                               print(f"Agent {self.id} crafted and placed a Workbench at ({self.x},{self.y}).")
+                               social_manager.broadcast_signal(self, f"Crafted:{recipe_name}", (self.x, self.y))
+                          else:
+                               print(f"Agent {self.id} crafted Workbench but failed to place it at ({self.x},{self.y}). Items lost?")
+                               # TODO: Handle failed placement (drop items? Refund?) For now, items are lost.
+                     elif recipe_name == 'SmallShelter': # Special case: Place shelter
+                          # For now, just add to inventory, placement would be another action
+                          self.inventory[recipe_name] = self.inventory.get(recipe_name, 0) + 1
+                          print(f"Agent {self.id} crafted {recipe_name}. Stored in inventory.")
+                          social_manager.broadcast_signal(self, f"Crafted:{recipe_name}", (self.x, self.y)) # Announce crafting
+                     else: # Default: Add to inventory
+                          self.inventory[recipe_name] = self.inventory.get(recipe_name, 0) + 1
+                          print(f"Agent {self.id} crafted {recipe_name}. Skill: {self.skills.get(details['skill'],0):.1f}")
+                          social_manager.broadcast_signal(self, f"Crafted:{recipe_name}", (self.x, self.y)) # Announce crafting
+
                      self.energy -= cfg.CRAFT_ENERGY_COST
                      self.learn_skill(details['skill'])
-                     print(f"Agent {self.id} crafted {recipe_name}. Skill: {self.skills.get(details['skill'],0):.1f}")
-                     social_manager.broadcast_signal(self, f"Crafted:{recipe_name}", (self.x, self.y)) # Announce crafting
                      return True # Crafting complete
                  else: return False # Still crafting
 
             # --- Phase 3 Actions ---
             elif self.current_action == 'Invent':
-                 action_duration = base_action_duration * 3 # Invention takes time
+                 # Requires being AT a workbench
+                 if not self._is_at_workbench():
+                     print(f"Agent {self.id} cannot Invent - not at workbench.")
+                     return True # Fail action
+
+                 action_duration = base_action_duration * 4 # Invention takes significant time
                  if self.action_timer >= action_duration:
                      discovered_recipe = self.knowledge.attempt_invention(self.inventory)
-                     self.energy -= cfg.CRAFT_ENERGY_COST # Invention costs energy
+                     self.energy -= cfg.INVENT_ENERGY_COST
                      if discovered_recipe:
-                         # Note: attempt_invention should add recipe to knowledge if successful
                          print(f"Agent {self.id} *** INVENTED *** {discovered_recipe}!")
                          social_manager.broadcast_signal(self, f"Invented:{discovered_recipe}", (self.x, self.y))
-                     # else: # Failed invention attempt (optional print)
-                     #    print(f"Agent {self.id} invention attempt yielded nothing.")
+                     # else: print(f"Agent {self.id} invention attempt yielded nothing.")
                      return True # Invention attempt complete (success or fail)
                  else: return False # Still thinking...
 
+            elif self.current_action == 'GoToWorkbench:Invent':
+                 # Action completes when workbench is reached (path is empty, agent is at stand pos)
+                 # Now, the agent should choose the 'Invent' action in the next tick.
+                 print(f"Agent {self.id} arrived at workbench. Will attempt to Invent next.")
+                 return True # Arrived, action complete. Let AI choose 'Invent' next.
+
+
             # --- Phase 4 Actions ---
             elif action_type == 'Help':
-                # Assumed agent is at 'stand' position near target
                 target_id = self.action_target['goal']
                 target_agent = next((a for a in agents if a.id == target_id and a.health > 0), None)
+
                 if target_agent:
                      distance = abs(self.x - target_agent.x) + abs(self.y - target_agent.y)
                      if distance <= 2: # Check proximity again
-                          # Attempt the actual help action via SocialManager (e.g., transfer item)
-                          # This involves interaction logic (transfer food/water) inside attempt_helping
+                          # Attempt the actual help action via SocialManager
                           help_successful = social_manager.attempt_helping(self, target_agent)
-                          if help_successful: print(f"Agent {self.id} successfully helped Agent {target_id}.")
+                          if help_successful:
+                               print(f"Agent {self.id} successfully helped Agent {target_id}.")
+                               self.energy -= cfg.GATHER_ENERGY_COST * 0.2 # Small energy cost for helping
                           # else: print(f"Agent {self.id} help attempt towards {target_id} failed (conditions not met?).")
-                     else: print(f"Agent {self.id} too far from target {target_id} to help.")
-                # else: print(f"Agent {self.id} cannot help target {target_id} (target gone).") # Already checked earlier
+                     else: print(f"Agent {self.id} too far from target {target_id} ({distance} units) to help.")
+                # else: Already checked agent existence in feasibility
 
-                return True # Help attempt is complete (success or fail in SocialManager)
+                return True # Help attempt is complete (success or fail handled in SocialManager)
 
             # --- Fallback ---
             else:
@@ -603,7 +801,7 @@ class Agent:
                 return True # Unknown action, stop doing it
 
         except Exception as e:
-            print(f"Error performing action {self.current_action} for agent {self.id}: {e}")
+            print(f"!!! Error performing action {self.current_action} for agent {self.id}: {e}")
             import traceback
             traceback.print_exc()
             return True # Treat error as action completion/failure
@@ -611,53 +809,61 @@ class Agent:
 
     def _complete_action(self):
         """ Cleanup after an action is finished or failed """
-        # print(f"Agent {self.id} completed action: {self.current_action}")
+        if self.current_action and self.current_action != "Idle":
+            # print(f"Agent {self.id} completed action: {self.current_action}")
+            pass # Reduce log spam
         self.current_action = None
         self.action_target = None
         self.current_path = []
         self.action_timer = 0.0
 
     def _handle_death(self):
-        # This is called when health <= 0.
-        # The main loop handles removing the agent from the active list.
-        print(f"Agent {self.id} has died at ({self.x}, {self.y}).")
-        # Future: Could drop items, leave a corpse object in the world, etc.
+        print(f"Agent {self.id} has died at ({self.x}, {self.y}). Needs(H,T,E): ({self.hunger:.0f},{self.thirst:.0f},{self.energy:.0f})")
+        # Optional: Drop some inventory items
+        # for item, count in self.inventory.items():
+        #     if random.random() < 0.3: # 30% chance to drop each item type
+        #         # Need a mechanism to place items on the ground (e.g., Item resource type)
+        #         print(f"  (Agent {self.id} dropped {item})")
+        pass
 
     # --- Phase 2: Skills & Crafting Helpers ---
-    def learn_skill(self, skill_name, amount=cfg.SKILL_INCREASE_RATE):
+    def learn_skill(self, skill_name, boost=1.0):
         """ Increases skill level, learning by doing. Returns True if level increased. """
-        # Allow learning base skills and skills implicitly defined by recipes
+        if not skill_name: return False # Ignore if no skill associated
+
         is_known_skill_base = skill_name in self.skills
+        # Check if it's a skill used by any recipe (even if not explicitly in self.skills yet)
         is_recipe_skill = any(details.get('skill') == skill_name for details in cfg.RECIPES.values())
 
         if is_known_skill_base or is_recipe_skill:
-            current_level = self.skills.get(skill_name, cfg.INITIAL_SKILL_LEVEL)
+            current_level = self.skills.get(skill_name, cfg.INITIAL_SKILL_LEVEL) # Start at 0 if learning new recipe skill
             if current_level < cfg.MAX_SKILL_LEVEL:
-                # Diminishing returns: Learn faster at lower levels
-                increase = amount * (1.0 - (current_level / (cfg.MAX_SKILL_LEVEL + 1)))
+                # Diminishing returns + boost factor
+                increase = cfg.SKILL_INCREASE_RATE * boost * (1.0 - (current_level / (cfg.MAX_SKILL_LEVEL + 1)))
                 new_level = min(cfg.MAX_SKILL_LEVEL, current_level + increase)
-                # Only update if there's a noticeable increase (prevent float comparison issues)
+                # Update skill if increase is significant enough
                 if new_level > current_level + 0.01:
                     self.skills[skill_name] = new_level
+                    # print(f"Agent {self.id} skill {skill_name} increased to {new_level:.2f}") # Debug
                     return True
-        # Handle learning a completely new skill (e.g., via teaching, not tied to crafting)
-        elif not is_known_skill_base:
-             self.skills[skill_name] = min(cfg.MAX_SKILL_LEVEL, cfg.INITIAL_SKILL_LEVEL + amount)
-             print(f"Agent {self.id} learned NEW base skill: {skill_name}")
-             return True
+        else:
+             # Maybe learning a skill not tied to recipes (e.g. 'Social', 'Combat' later)
+             # print(f"Agent {self.id} attempted to learn unknown skill category: {skill_name}")
+             pass
         return False
 
 
     def _get_skill_multiplier(self, skill_name):
         """ Returns a multiplier based on skill level (e.g., for speed/efficiency) """
+        if not skill_name: return 1.0
         level = self.skills.get(skill_name, 0)
-        # Example: 1.0 at level 0, up to ~2.5 at max level (non-linear)
-        multiplier = 1.0 + 1.5 * (level / cfg.MAX_SKILL_LEVEL)**0.75
-        return max(0.1, multiplier) # Ensure multiplier doesn't go to zero or negative
+        # More impactful curve: starts at 1x, reaches ~3x at max skill
+        multiplier = 1.0 + 2.0 * (level / cfg.MAX_SKILL_LEVEL)**0.8
+        return max(0.1, multiplier) # Ensure non-zero
 
     def _has_ingredients(self, ingredients):
         """ Check inventory for required crafting ingredients """
-        if not ingredients: return True # No ingredients needed
+        if not ingredients: return True
         for item, required_count in ingredients.items():
             if self.inventory.get(item, 0) < required_count:
                 return False
@@ -673,185 +879,225 @@ class Agent:
     # --- Phase 4: Social Helpers ---
     def perceive_signal(self, sender_id, signal_type, position):
         """ Stores the latest received signal for processing next update """
+        # TODO: Maybe queue signals instead of just keeping latest? For now, latest is simpler.
         self.pending_signal = (sender_id, signal_type, position)
 
-    def _process_signals(self):
+    def _process_signals(self, agents, social_manager):
         """ Handle the latest received signal, potentially interrupting current action """
         if not self.pending_signal:
             return
 
-        sender_id, signal_type, position = self.pending_signal
+        sender_id, signal_type, signal_pos = self.pending_signal
         self.pending_signal = None # Consume the signal
 
         # print(f"Agent {self.id} processing signal '{signal_type}' from {sender_id}") # Debug
 
-        # Decide whether to react based on signal type, sender, agent's state
         relationship = self.knowledge.get_relationship(sender_id)
         current_action_util = self._get_current_action_utility()
 
         # Example Reactions:
-        if signal_type == 'Danger':
-            # High priority reaction, flee if utility is higher than current action
-            flee_utility = 0.95 # Very high importance
+        if signal_type == 'Danger': # TODO: Need a source of 'Danger' signals
+            flee_utility = 0.95
             if flee_utility > current_action_util:
                  print(f"Agent {self.id} reacts to DANGER signal from {sender_id}! Fleeing.")
                  self._complete_action() # Interrupt current action forcefully
-                 # Set a temporary 'Flee' state or just trigger Wander?
-                 # Forcing Wander might make it wander towards danger, need specific flee logic.
-                 # Simple immediate reaction: try to move directly away
-                 dx = self.x - position[0]
-                 dy = self.y - position[1]
-                 norm = math.sqrt(dx*dx + dy*dy)
+                 # Flee logic: move away from signal position
+                 dx = self.x - signal_pos[0]
+                 dy = self.y - signal_pos[1]
+                 norm = math.hypot(dx, dy)
                  if norm > 0:
-                     flee_x = int(self.x + dx / norm * cfg.WANDER_RADIUS) # Move further away
+                     flee_x = int(self.x + dx / norm * cfg.WANDER_RADIUS)
                      flee_y = int(self.y + dy / norm * cfg.WANDER_RADIUS)
                      flee_x = max(0, min(self.world.width - 1, flee_x))
                      flee_y = max(0, min(self.world.height - 1, flee_y))
-                     # Find nearest walkable to the flee target
                      flee_target = self._find_walkable_near(flee_x, flee_y)
                      if flee_target:
-                          self.current_action = 'Wander' # Use wander mechanism to move
-                          self.action_target = {'type': 'wander', 'stand': flee_target}
-                          self.current_path = self._plan_path(flee_target)
-                     else: # Trapped or error
-                          self.current_action = 'Idle' # Cannot flee
+                          # Use Wander action to flee to the target spot
+                          self.current_action = 'Wander'
+                          self.action_target = {'type': 'Wander', 'stand': flee_target, 'goal': flee_target}
+                          self.current_path = self._plan_path(flee_target, agents)
+                          if self.current_path is None: # Pathing failed
+                              self.current_action = 'Idle' # Cannot flee path
+                     else:
+                          self.current_action = 'Idle' # Cannot find flee spot
+                 else: # Danger signal originated from agent's own location? Strange. Idle.
+                      self.current_action = 'Idle'
+                 # Mark action as changed so execution waits until next tick
+                 self.pending_signal = True # Use pending_signal flag hackily
 
-        elif signal_type == 'FoundFood':
-            # React if hungry and trust sender enough, and if finding food is more important now
-            food_signal_utility = (self.hunger / cfg.MAX_HUNGER)**2 * (1.0 + max(0, relationship)) # Use squared hunger, factor in trust
-            if food_signal_utility > current_action_util and self.hunger > cfg.MAX_HUNGER * 0.3: # React even if only moderately hungry
-                 print(f"Agent {self.id} reacting to food signal from {sender_id}")
+
+        elif signal_type == 'FoundFood' and self.hunger > cfg.MAX_HUNGER * 0.3: # React if hungry
+            # Utility based on hunger and relationship
+            food_signal_utility = (self.hunger / cfg.MAX_HUNGER)**1.5 * (0.8 + relationship * 0.4) # Trust influences utility
+            if food_signal_utility > current_action_util:
+                 print(f"Agent {self.id} reacting to food signal from {sender_id} at {signal_pos}")
                  self._complete_action() # Interrupt current action
                  # Set goal to investigate food source location
-                 stand_pos = self._find_adjacent_walkable(position[0], position[1])
+                 stand_pos = self._find_adjacent_walkable(signal_pos[0], signal_pos[1])
                  if stand_pos:
-                      # Tentatively set action, _choose_action might override if thirst is critical
-                      self.current_action = 'SatisfyHunger'
-                      self.action_target = {'type': 'location_signal', 'goal': position, 'stand': stand_pos}
-                      self.current_path = self._plan_path(stand_pos)
-                      if not self.current_path and (self.x, self.y) != stand_pos: # Path failed?
-                           self.current_action = None # Allow re-evaluation
+                      self.current_action = 'SatisfyHunger' # Tentative action
+                      self.action_target = {'type': 'SatisfyHunger', 'goal': signal_pos, 'stand': stand_pos, 'from_signal': True} # Mark as from signal
+                      self.current_path = self._plan_path(stand_pos, agents)
+                      if self.current_path is None or (not self.current_path and (self.x, self.y) != stand_pos):
+                           print(f"Agent {self.id}: Failed to path to food signal location.")
+                           self.current_action = None # Allow re-evaluation next tick
+                      else:
+                           self.pending_signal = True # Mark action changed
+                 else:
+                      print(f"Agent {self.id}: Cannot find walkable spot near food signal at {signal_pos}.")
+                      self.current_action = None # Re-evaluate
 
         elif signal_type.startswith("Crafted:") or signal_type.startswith("Invented:"):
-             # Passive learning: Learn recipe if close and relationship is okay
              item_name = signal_type.split(':')[1]
+             # Learn recipe passively if requirements met
              if item_name in cfg.RECIPES and not self.knowledge.knows_recipe(item_name):
-                  dist_sq = (self.x - position[0])**2 + (self.y - position[1])**2
-                  learn_proximity_sq = 7**2 # Moderately close to hear/see?
-                  if dist_sq < learn_proximity_sq and relationship >= -0.1: # Learn from non-hostile/neutral
-                      # Add intelligence/curiosity check? Chance based?
-                      if random.random() < 0.8: # 80% chance to learn from signal
-                          self.knowledge.add_recipe(item_name)
-                          print(f"Agent {self.id} learned recipe '{item_name}' from {sender_id}'s signal.")
+                  dist_sq = (self.x - signal_pos[0])**2 + (self.y - signal_pos[1])**2
+                  learn_proximity_sq = (cfg.SIGNAL_RANGE * 0.7)**2 # Need to be relatively close
+                  # Learn more easily from friends, less likely from disliked agents
+                  learn_chance = cfg.PASSIVE_LEARN_CHANCE * (0.7 + relationship * 0.6)
+                  if dist_sq < learn_proximity_sq and relationship >= cfg.LEARNING_RELATIONSHIP_THRESHOLD and random.random() < learn_chance:
+                      self.knowledge.add_recipe(item_name)
+                      # print(f"Agent {self.id} learned recipe '{item_name}' from {sender_id}'s signal.") # Debug
 
 
     def decide_to_learn(self, teacher_id, skill_name):
-        """ AI decides if it wants to accept teaching (called by SocialManager) """
-        # Prioritize critical needs over learning
-        if self.thirst > cfg.MAX_THIRST * 0.85 or self.hunger > cfg.MAX_HUNGER * 0.85:
+        """ AI decides if it wants to accept teaching. """
+        # Prioritize critical needs
+        if self.thirst > cfg.MAX_THIRST * 0.9 or self.hunger > cfg.MAX_HUNGER * 0.9 or self.health < cfg.MAX_HEALTH * 0.4:
+            # print(f"Agent {self.id} refuses teaching '{skill_name}' from {teacher_id} due to critical needs.")
             return False
 
-        # Don't interrupt important actions like gathering critical resource?
-        # if self.current_action and self._get_current_action_utility() > 0.7: return False
+        # Don't interrupt very high utility actions?
+        current_util = self._get_current_action_utility()
+        if current_util > 0.8 and self.current_action not in ['Idle', 'Wander', 'Rest']:
+             # print(f"Agent {self.id} refuses teaching '{skill_name}' from {teacher_id} due to important action '{self.current_action}'.")
+             return False
 
         # Check relationship with teacher
         relationship = self.knowledge.get_relationship(teacher_id)
-        if relationship < 0.0: # Only learn from neutral or friendly?
+        if relationship < cfg.LEARNING_RELATIONSHIP_THRESHOLD:
+            # print(f"Agent {self.id} refuses teaching '{skill_name}' from {teacher_id} due to low relationship ({relationship:.2f}).")
             return False
 
-        # Simple acceptance criteria
+        # Check if already proficient
+        if self.skills.get(skill_name, 0) > cfg.MAX_SKILL_LEVEL * 0.8:
+             # print(f"Agent {self.id} refuses teaching '{skill_name}' from {teacher_id} - already skilled.")
+             return False
+
         print(f"Agent {self.id} accepts learning '{skill_name}' from {teacher_id}")
-        # Could set a state 'BeingTaught' to pause other actions briefly
-        # self._complete_action() # Interrupt current action to learn
-        # self.current_action = "BeingTaught" # Example state
+        # Interrupt current action to learn
+        self._complete_action()
+        # Set a temporary state? Or just allow learn_skill to happen directly?
+        # Direct learning is simpler for now. The cost/time is handled by the teacher.
+        self.energy -= cfg.LEARN_ENERGY_COST # Cost energy to learn
         return True
 
     def _find_agent_to_help(self, agents):
-         """ Finds nearby agent in critical need that this agent *can* help """
+         """ Finds nearby agent in critical need that this agent *can* help and has decent relationship with. """
          best_target = None
-         max_weighted_need = 0 # Combine need level and relationship
+         max_weighted_need = 0 # Combined need level, relationship, sociability
 
+         potential_targets = []
          for other in agents:
-              if other != self and other.health > 0: # Check living agents only
+              if other.id != self.id and other.health > 0: # Check living agents only
                    dist = abs(self.x - other.x) + abs(self.y - other.y)
-                   if dist < 7: # Check within reasonable interaction range
-                       need_level = 0
-                       can_help_flag = False
+                   if dist < cfg.AGENT_VIEW_RADIUS * 0.7: # Check within interaction range
+                       potential_targets.append(other)
 
-                       # Check Hunger Need
-                       if other.hunger > cfg.MAX_HUNGER * 0.75 and self.inventory.get('Food', 0) > 0:
-                           need_level = max(need_level, (other.hunger / cfg.MAX_HUNGER)**2) # Squared need
-                           can_help_flag = True
+         if not potential_targets: return None
 
-                       # Check Thirst Need (if agent can carry/give water)
-                       # if other.thirst > cfg.MAX_THIRST * 0.75 and self.inventory.get('Waterskin', 0) > 0:
-                       #    need_level = max(need_level, (other.thirst / cfg.MAX_THIRST)**2 * 1.1) # Thirst slightly more urgent
-                       #    can_help_flag = True
+         # Evaluate potential targets
+         for other in potential_targets:
+            need_level = 0
+            can_help_flag = False
 
-                       if can_help_flag:
-                           relationship = self.knowledge.get_relationship(other.id)
-                           # Consider helping only if relationship is not too negative
-                           if relationship > -0.3:
-                               # Weight need by relationship (help friends more readily)
-                               weighted_need = need_level * (1 + relationship) * self.sociability
-                               if weighted_need > max_weighted_need:
-                                   max_weighted_need = weighted_need
-                                   best_target = other
+            # Check Hunger Need
+            if other.hunger > cfg.MAX_HUNGER * 0.7 and self.inventory.get('Food', 0) >= 1:
+                need_level = max(need_level, (other.hunger / cfg.MAX_HUNGER)**2)
+                can_help_flag = True
+
+            # Check Thirst Need (Requires carrying water mechanism)
+            # if other.thirst > cfg.MAX_THIRST * 0.7 and self.inventory.get('WaterskinFull', 0) >= 1:
+            #    need_level = max(need_level, (other.thirst / cfg.MAX_THIRST)**2 * 1.1) # Thirst slightly more urgent
+            #    can_help_flag = True
+
+            if can_help_flag:
+                relationship = self.knowledge.get_relationship(other.id)
+                # Consider helping only if relationship is not too negative
+                if relationship >= cfg.HELPING_RELATIONSHIP_THRESHOLD:
+                    # Weight need by relationship and sociability
+                    weighted_need = need_level * (0.5 + relationship + self.sociability) # Combined factor
+                    if weighted_need > max_weighted_need:
+                        max_weighted_need = weighted_need
+                        best_target = other
          return best_target
 
     def _get_current_action_utility(self):
-         """ Estimate utility of the current action (rough approximation) """
-         if not self.current_action or self.current_action == 'Idle': return 0
-         # Match utility calculations (using squared urgency for needs)
-         if self.current_action == 'SatisfyThirst': return (self.thirst / cfg.MAX_THIRST)**2
-         if self.current_action == 'SatisfyHunger': return (self.hunger / cfg.MAX_HUNGER)**2
-         if self.current_action == 'Rest': return ((cfg.MAX_ENERGY - self.energy) / cfg.MAX_ENERGY)**2 if self.energy < cfg.MAX_ENERGY else 0
+         """ Estimate utility of the current action for interruption checks. """
+         if not self.current_action or self.current_action == 'Idle': return 0.0
 
-         # Assign rough estimates for other actions (can be refined)
-         if self.current_action.startswith('Gather'): return 0.3
-         if self.current_action.startswith('Craft'): return 0.4 # Crafting useful things has decent utility
-         if self.current_action == ('Invent'): return 0.2
-         if self.current_action.startswith('Help'): return 0.6 # Helping is considered important
-         if self.current_action == ('Wander'): return 0.05
+         action_base = self.current_action.split(':')[0]
 
-         return 0.1 # Default low utility for actions not explicitly estimated
+         # Needs have squared utility based on urgency
+         if action_base == 'SatisfyThirst': return (self.thirst / cfg.MAX_THIRST)**2
+         if action_base == 'SatisfyHunger': return (self.hunger / cfg.MAX_HUNGER)**2
+         if action_base == 'Rest': return ((cfg.MAX_ENERGY - self.energy) / cfg.MAX_ENERGY)**2 if self.energy < cfg.MAX_ENERGY else 0.0
+
+         # Rough estimates for others (can be refined based on goals)
+         if action_base == 'GatherWood': return 0.4 * (1.5 if self.inventory.get('CrudeAxe',0)>0 else 1.0) # Value depends on tool
+         if action_base == 'GatherStone': return 0.35 * (1.5 if self.inventory.get('StonePick',0)>0 else 1.0)
+         if action_base == 'Craft':
+              recipe_name = self.action_target.get('recipe', '')
+              if recipe_name == 'CrudeAxe' and self.inventory.get('CrudeAxe', 0) == 0: return 0.7
+              if recipe_name == 'StonePick' and self.inventory.get('StonePick', 0) == 0: return 0.65
+              if recipe_name == 'Workbench' and not self._is_workbench_nearby(5): return 0.6
+              return 0.5 # General crafting is quite important
+         if action_base == 'Invent' or action_base == 'GoToWorkbench': return 0.2 # Lower base utility
+         if action_base == 'Help': return 0.65 # Helping is important
+         if action_base == 'Wander': return 0.05
+
+         return 0.1 # Default low utility
 
 
-    def _find_adjacent_walkable(self, x, y):
-        """ Finds a walkable tile adjacent to (x, y), prioritizing cardinal directions """
-        # Check cardinal directions first
+    def _find_adjacent_walkable(self, x, y, walkability_matrix=None):
+        """ Finds a walkable tile adjacent to (x, y), using world matrix if none provided. """
+        matrix = walkability_matrix if walkability_matrix is not None else self.world.walkability_matrix
+        # Prioritize cardinal directions
         for dx, dy in [(0,1), (0,-1), (1,0), (-1,0)]:
             nx, ny = x + dx, y + dy
             if 0 <= nx < self.world.width and 0 <= ny < self.world.height:
-                if self.world.walkability_matrix[ny, nx] == 1:
+                if matrix[ny, nx] == 1:
                     return (nx, ny)
         # Check diagonal directions if no cardinal found
         for dx, dy in [(1,1), (1,-1), (-1,1), (-1,-1)]:
             nx, ny = x + dx, y + dy
             if 0 <= nx < self.world.width and 0 <= ny < self.world.height:
-                if self.world.walkability_matrix[ny, nx] == 1:
+                if matrix[ny, nx] == 1:
                     return (nx, ny)
-        return None # No adjacent walkable found
+        return None
 
 
-    def _find_walkable_near(self, x, y):
-         """ Finds the nearest walkable tile to x,y using BFS, limited search """
+    def _find_walkable_near(self, x, y, max_search_dist=5):
+         """ Finds the nearest walkable tile to x,y using BFS, limited search. """
          if 0 <= x < self.world.width and 0 <= y < self.world.height and self.world.walkability_matrix[y, x] == 1:
              return (x, y) # Target itself is walkable
 
          q = [(x, y, 0)] # x, y, distance
          visited = set([(x,y)])
-         max_search_dist = 5 # Limit search radius
 
          while q:
              curr_x, curr_y, dist = q.pop(0)
              if dist >= max_search_dist: continue
 
-             for dx, dy in [(0,1), (0,-1), (1,0), (-1,0), (1,1), (1,-1), (-1,1), (-1,-1)]:
+             # Check neighbors in order: Cardinal first, then Diagonal
+             neighbors = [(0,1), (0,-1), (1,0), (-1,0), (1,1), (1,-1), (-1,1), (-1,-1)]
+             for dx, dy in neighbors:
                  nx, ny = curr_x + dx, curr_y + dy
                  if 0 <= nx < self.world.width and 0 <= ny < self.world.height and (nx, ny) not in visited:
                      if self.world.walkability_matrix[ny, nx] == 1:
                          return (nx, ny) # Found nearest walkable
                      visited.add((nx, ny))
+                     # Only add valid grid points to queue (even if unwalkable) to explore from them
                      q.append((nx, ny, dist + 1))
+
          return None # No walkable tile found nearby

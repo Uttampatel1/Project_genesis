@@ -1,12 +1,5 @@
 
 
-**How to Run:**
-
-1.  Save each code block into its corresponding file within a `project_genesis` directory.
-2.  Make sure you have Python installed.
-3.  Install the required libraries: `pip install pygame numpy pathfinding-python` (or use `pip install -r requirements.txt`).
-4.  Run the main script from your terminal: `python project_genesis/main.py`
-
 **Next Steps & Considerations:**
 
 *   **Phase 1 Refinement:** Balance needs decay, action effects, resource availability. Improve pathfinding robustness (e.g., what if target is unreachable?).

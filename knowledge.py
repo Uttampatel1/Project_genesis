@@ -5,20 +5,26 @@ import config as cfg
 class KnowledgeSystem:
     def __init__(self, agent_id):
         self.agent_id = agent_id
-        self.known_resource_locations = {} # type: [(x, y), (x, y), ...]
+        # Known locations: type -> set of (x,y) tuples for quick lookup
+        self.known_resource_locations = {res_type: set() for res_type in cfg.RESOURCE_INFO.keys()}
+        self.known_resource_locations[cfg.RESOURCE_WATER] = set() # Add water explicitly if needed
+
         self.known_recipes = set() # set of recipe names (e.g., 'CrudeAxe')
         self.relationships = {} # other_agent_id: relationship_score (-1.0 to 1.0)
 
     def add_resource_location(self, resource_type, x, y):
-        if resource_type not in self.known_resource_locations:
-            self.known_resource_locations[resource_type] = []
-        if (x, y) not in self.known_resource_locations[resource_type]:
-            # Limit memory? For now, add all discovered.
-            self.known_resource_locations[resource_type].append((x, y))
+        # Use sets for efficient add/check/remove
+        if resource_type in self.known_resource_locations:
+             self.known_resource_locations[resource_type].add((x, y))
+             # Limit memory? Could prune oldest or farthest if set gets too large.
+
+    def remove_resource_location(self, resource_type, x, y):
+         if resource_type in self.known_resource_locations:
+              self.known_resource_locations[resource_type].discard((x, y)) # discard doesn't raise error if not found
 
     def get_known_locations(self, resource_type):
-        # Maybe return locations closer to agent first? Future optimization.
-        return self.known_resource_locations.get(resource_type, [])
+        # Returns a list of known locations (convert from set)
+        return list(self.known_resource_locations.get(resource_type, set()))
 
     def add_recipe(self, recipe_name):
         if recipe_name not in self.known_recipes:
@@ -33,75 +39,70 @@ class KnowledgeSystem:
     # --- Phase 3: Invention ---
     def attempt_invention(self, inventory):
         """
-        Simple Combinatorial Exploration Placeholder.
-        Tries combining two random items from inventory and checks if they match
-        an unknown 2-ingredient recipe for which the agent has enough materials.
+        Tries combining two items (types) from inventory and checks if they match
+        an unknown recipe. Improved logic.
         """
-        if not inventory or len(inventory) < 2: # Need at least two distinct item types, or >= 2 of one type
-            # Check if there's at least one item type with count >= 2
-            can_combine_same = any(count >= 2 for count in inventory.values())
-            # Check if there are at least two different item types
-            can_combine_different = len(inventory) >= 2
-            if not (can_combine_same or can_combine_different):
-                 return None
+        if not inventory: return None
 
-        # --- Corrected Invention Logic ---
-        try:
-            # Select two items (can be the same type if count >= 2)
-            available_items = list(inventory.keys())
-            item1_name = random.choice(available_items)
+        available_item_types = list(inventory.keys())
+        if not available_item_types: return None
 
-            # Ensure we can pick a second item (either different, or same if count >= 2)
-            second_item_options = available_items[:] # Copy list
-            if inventory.get(item1_name, 0) < 2:
-                if item1_name in second_item_options:
-                     second_item_options.remove(item1_name) # Cannot pick same item again if only 1 exists
+        # Choose first item type
+        item1_name = random.choice(available_item_types)
+        item1_count = inventory.get(item1_name, 0)
 
-            if not second_item_options: return None # No valid second item to pick
+        # Choose second item type (can be same as first if count >= 2)
+        possible_second_items = available_item_types[:]
+        if item1_count < 2:
+             if item1_name in possible_second_items:
+                 possible_second_items.remove(item1_name) # Cannot pick same again
 
-            item2_name = random.choice(second_item_options)
+        if not possible_second_items: return None # No valid second item combination possible
 
-            # Now check against predefined (but potentially unknown) recipes
-            for recipe_name, details in cfg.RECIPES.items():
-                # Only consider recipes with exactly two ingredient types for this simple mechanism
-                ingredients_needed = details.get('ingredients', {})
-                if len(ingredients_needed) == 2:
-                    # Get the names and counts of the required ingredients
-                    req_items = list(ingredients_needed.keys())
-                    req_item1_name, req_item2_name = req_items[0], req_items[1]
-                    req_item1_count = ingredients_needed[req_item1_name]
-                    req_item2_count = ingredients_needed[req_item2_name]
+        item2_name = random.choice(possible_second_items)
+        item2_count = inventory.get(item2_name, 0)
 
-                    # Check if the selected items match the required items (order doesn't matter)
-                    match = (item1_name == req_item1_name and item2_name == req_item2_name) or \
-                            (item1_name == req_item2_name and item2_name == req_item1_name)
+        # Create the 'combination' signature (order doesn't matter)
+        combination = tuple(sorted((item1_name, item2_name)))
 
-                    if match:
-                        # Check if the agent actually has enough quantity of both ingredients
-                        has_enough_item1 = inventory.get(req_item1_name, 0) >= req_item1_count
-                        has_enough_item2 = inventory.get(req_item2_name, 0) >= req_item2_count
+        # Check against predefined (but potentially unknown) recipes
+        for recipe_name, details in cfg.RECIPES.items():
+             if self.knows_recipe(recipe_name): continue # Skip known recipes
 
-                        # Check if recipe is already known
-                        is_known = self.knows_recipe(recipe_name)
+             ingredients_needed = details.get('ingredients', {})
+             # Check if this recipe uses exactly the two combined item types
+             recipe_req_items = tuple(sorted(ingredients_needed.keys()))
 
-                        if has_enough_item1 and has_enough_item2 and not is_known:
-                            # DISCOVERY! Add the recipe and return its name
-                            self.add_recipe(recipe_name)
-                            return recipe_name # Return the name of the discovered recipe
+             if combination == recipe_req_items:
+                  # Check if the agent actually has enough quantity of both ingredients
+                  req_item1_name = recipe_req_items[0]
+                  req_item1_needed = ingredients_needed[req_item1_name]
+                  has_enough_item1 = inventory.get(req_item1_name, 0) >= req_item1_needed
 
-        except Exception as e:
-            # Catch potential errors during random choice or dict access if inventory/recipes are weird
-            print(f"Error during invention attempt for Agent {self.agent_id}: {e}")
-            return None
+                  # Handle recipes with only one type of ingredient (e.g., 2 wood -> ?)
+                  if len(recipe_req_items) == 1:
+                      if has_enough_item1:
+                          self.add_recipe(recipe_name)
+                          return recipe_name
+                  # Handle two different ingredient types
+                  elif len(recipe_req_items) == 2:
+                      req_item2_name = recipe_req_items[1]
+                      req_item2_needed = ingredients_needed[req_item2_name]
+                      has_enough_item2 = inventory.get(req_item2_name, 0) >= req_item2_needed
 
-        return None # No new 2-item recipe discovered this attempt
+                      if has_enough_item1 and has_enough_item2:
+                          self.add_recipe(recipe_name)
+                          return recipe_name # Return the name of the discovered recipe
 
+        return None # No new recipe discovered this attempt
 
     # --- Phase 4: Social Knowledge ---
     def update_relationship(self, other_agent_id, change):
+        if other_agent_id == self.agent_id: return # Cannot have relationship with self
         current = self.relationships.get(other_agent_id, 0)
         self.relationships[other_agent_id] = max(-1.0, min(1.0, current + change))
         # print(f"Agent {self.agent_id} relationship with {other_agent_id}: {self.relationships[other_agent_id]:.2f}") # Debug
 
     def get_relationship(self, other_agent_id):
+        if other_agent_id == self.agent_id: return 1.0 # Max relationship with self? Or 0? Let's use 0.
         return self.relationships.get(other_agent_id, 0) # Default neutral (0)
