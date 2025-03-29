@@ -3,8 +3,9 @@ import numpy as np
 from pathfinding.core.diagonal_movement import DiagonalMovement
 from pathfinding.core.grid import Grid
 from pathfinding.finder.a_star import AStarFinder
-import time # For debug
-import config as cfg # Import config
+import time # For debug timing
+import config as cfg # Import config for debug flags and limits
+import traceback # For error logging
 
 def find_path(world_grid_data, start_pos, end_pos):
     """
@@ -17,8 +18,8 @@ def find_path(world_grid_data, start_pos, end_pos):
 
     Returns:
         list: A list of pathfinding.core.node.GridNode objects representing the path,
-              excluding the start node. Returns empty list if start==end or no path found.
-              Returns None if start/end invalid or internal error.
+              excluding the start node. Returns empty list if start==end.
+              Returns None if no path found, start/end invalid, or internal error.
     """
     start_time = time.time()
     try:
@@ -27,60 +28,80 @@ def find_path(world_grid_data, start_pos, end_pos):
         end_pos = (int(end_pos[0]), int(end_pos[1]))
 
         grid_height, grid_width = world_grid_data.shape
-        # Basic bounds check
+
+        # Basic bounds check for start and end positions
         if not (0 <= start_pos[0] < grid_width and 0 <= start_pos[1] < grid_height):
             if cfg.DEBUG_PATHFINDING: print(f"Pathfinding Error: Start node {start_pos} out of bounds.")
-            return None
+            return None # Invalid start
         if not (0 <= end_pos[0] < grid_width and 0 <= end_pos[1] < grid_height):
              if cfg.DEBUG_PATHFINDING: print(f"Pathfinding Error: End node {end_pos} out of bounds.")
-             return None
+             return None # Invalid end
 
         # Create grid object AFTER bounds check
+        # The pathfinding library expects matrix dimensions as (width, height)
+        # but numpy arrays are (height, width). Transpose is needed if library expects (w,h).
+        # Let's assume the library handles numpy arrays correctly (row=y, col=x)
         grid = Grid(matrix=world_grid_data)
-        start = grid.node(start_pos[0], start_pos[1])
-        end = grid.node(end_pos[0], end_pos[1])
+        start_node = grid.node(start_pos[0], start_pos[1])
+        end_node = grid.node(end_pos[0], end_pos[1])
 
-        # Check walkability using the grid object, which handles node creation
-        if not start.walkable:
-            # This should ideally be handled by the caller (e.g., find adjacent start)
-            if cfg.DEBUG_PATHFINDING: print(f"Pathfinding Error: Start node {start_pos} is not walkable.")
-            return None # Cannot start path from unwalkable node
-        if not end.walkable:
-             # Caller should handle this (e.g., find adjacent target), but log warning.
-             if cfg.DEBUG_PATHFINDING: print(f"Pathfinding Warning: End node {end_pos} is not walkable (A* target adjusted by caller).")
-             # Pathfinding might still work if caller provided an adjacent walkable end_pos
+        # Check walkability using the grid object's nodes
+        # The Agent logic should handle adjusting start/end if they are blocked,
+        # but we add checks here for robustness. find_path requires walkable start/end.
+        if not start_node.walkable:
+            if cfg.DEBUG_PATHFINDING: print(f"Pathfinding Error: Start node {start_pos} is not walkable in the provided grid.")
+            # Agent logic should have prevented this call or adjusted 'start_pos'
+            return None
+        if not end_node.walkable:
+             if cfg.DEBUG_PATHFINDING: print(f"Pathfinding Warning: End node {end_pos} is not walkable in the provided grid (Caller should have adjusted).")
+             # A* requires a walkable end node.
+             return None
 
+        # Configure A* finder: allow diagonal movement, default weight
         finder = AStarFinder(diagonal_movement=DiagonalMovement.always, weight=1)
 
-        # Use the library's find_path method
-        path, runs = finder.find_path(start, end, grid)
+        # Limit iterations to prevent runaway calculations on impossible paths
+        finder.max_iterations = cfg.MAX_PATHFINDING_ITERATIONS
 
+        # Find the path using the library
+        path, runs = finder.find_path(start_node, end_node, grid)
+
+        # Performance logging for slow paths
         duration = time.time() - start_time
-        if cfg.DEBUG_PATHFINDING and duration > 0.01: # Log slow paths
-             print(f"Pathfinding took {duration:.4f}s for {start_pos}->{end_pos} ({runs} runs). Path length: {len(path)}")
+        if cfg.DEBUG_PATHFINDING and duration > 0.01: # Log paths taking longer than 10ms
+             path_len = len(path) if path else 0
+             print(f"Pathfinding took {duration:.4f}s for {start_pos}->{end_pos} ({runs} runs). Path length: {path_len}")
 
-        # path[0] is the start node. Return path excluding the start node.
-        return path[1:] if path else []
+        # Return path excluding the start node if found, otherwise None for no path
+        if path:
+            return path[1:] # Exclude the starting node itself
+        else:
+             # No path found between the (potentially adjusted) start and end nodes
+             return None
 
     except Exception as e:
         # Catch potential errors from the pathfinding library or unexpected issues
         print(f"!!! Pathfinding unexpected error for {start_pos} -> {end_pos}: {e}")
-        import traceback
         traceback.print_exc()
         return None # Indicate error state
 
 def create_walkability_matrix(world_terrain_map, world_resource_map):
-    """ Creates a matrix where 1 is walkable, 0 is not, considering terrain and blocking resources. """
+    """
+    Creates a walkability matrix (1=walkable, 0=obstacle) based on terrain
+    and resources that block movement.
+    """
     height, width = world_terrain_map.shape
-    # Start with all ground walkable
-    walkability_matrix = (world_terrain_map == cfg.TERRAIN_GROUND).astype(int)
+    # Start with ground tiles being walkable (1), others not (0)
+    walkability_matrix = (world_terrain_map == cfg.TERRAIN_GROUND).astype(np.uint8) # Use uint8 for efficiency
 
-    # Mark non-walkable resources as 0
+    # Iterate through resources and mark tiles as non-walkable if resource blocks walk
     for y in range(height):
         for x in range(width):
-            resource = world_resource_map[y, x]
-            # Check if resource exists and has the 'blocks_walk' attribute/property set to True
-            if resource and getattr(resource, 'blocks_walk', False):
-                 walkability_matrix[y, x] = 0
+            # Only need to check if tile is currently marked walkable
+            if walkability_matrix[y, x] == 1:
+                resource = world_resource_map[y, x]
+                # Check if resource exists and its 'blocks_walk' attribute is True
+                if resource and getattr(resource, 'blocks_walk', False):
+                     walkability_matrix[y, x] = 0 # Mark as non-walkable
 
     return walkability_matrix
