@@ -130,9 +130,13 @@ def main():
         draw_world(screen, world, social_manager) # Pass social_manager to draw signals
 
         # Draw agents
+        # for agent in agents: # Draw from the potentially updated list
+        #     if agent != selected_agent and agent.health > 0: draw_agent(screen, agent)
         for agent in agents: # Draw from the potentially updated list
-            if agent != selected_agent and agent.health > 0: draw_agent(screen, agent)
-        if selected_agent and selected_agent.health > 0: draw_agent(screen, selected_agent) # Draw selected last
+            if agent.health > 0:
+                is_sel = (agent == selected_agent) # Check if this agent is the selected one
+                draw_agent(screen, agent, is_selected=is_sel) 
+        # if selected_agent and selected_agent.health > 0: draw_agent(screen, selected_agent) # Draw selected last
 
         draw_ui(screen, world, agents, selected_agent, social_manager, clock) # Pass social_manager for UI info? (Not used yet)
         pygame.display.flip()
