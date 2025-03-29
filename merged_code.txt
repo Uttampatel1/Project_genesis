@@ -1,0 +1,2474 @@
+# Contents of agent.py
+# Contents of agent.py
+# agent.py
+import random
+import math
+import config as cfg
+from pathfinding_utils import find_path
+from knowledge import KnowledgeSystem
+from world import Resource # For type checking and placing workbenches
+from social import Signal # For type hinting perceive_signal
+import traceback
+
+# Global counter for agent IDs
+_agent_id_counter = 0
+
+class Agent:
+    """
+    Represents an agent in the simulation with needs, skills, knowledge,
+    and the ability to perceive, decide, and act within the world.
+    Phase 4: Includes social attributes, relationships, signaling, teaching, helping.
+    """
+
+    def __init__(self, x, y, world):
+        """ Initializes an agent at a given position in the world. """
+        global _agent_id_counter
+        self.id = _agent_id_counter; _agent_id_counter += 1
+        self.x = x; self.y = y          # Current grid coordinates
+        self.world = world              # Reference to the world object
+
+        # Basic Needs and State
+        self.health = cfg.MAX_HEALTH
+        self.energy = cfg.MAX_ENERGY
+        self.hunger = 0                 # 0 = Not hungry, cfg.MAX_HUNGER = Starving
+        self.thirst = 0                 # 0 = Not thirsty, cfg.MAX_THIRST = Dehydrated
+
+        # Action State
+        self.current_action = None      # String identifier (e.g., "GatherWood", "Craft:CrudeAxe", "Help:12:Food")
+        self.action_target = None       # Dictionary holding target info (goal, stand, recipe, agent_id, item, etc.)
+        self.current_path = []          # List of (x, y) tuples for movement
+        self.action_timer = 0.0         # Timer for timed actions (gathering, crafting, teaching, etc.)
+
+        # Inventory & Skills
+        self.inventory = {}             # item_name: count
+        self.skills = {                 # skill_name: level
+            'GatherWood': cfg.INITIAL_SKILL_LEVEL,
+            'GatherStone': cfg.INITIAL_SKILL_LEVEL,
+            'BasicCrafting': 1.0,       # Start with skill level 1 to enable axe crafting
+        }
+
+        # Knowledge & Attributes
+        self.knowledge = KnowledgeSystem(self.id) # Agent's memory and beliefs
+        self.intelligence = random.uniform(0.3, 0.8) # Factor influencing invention speed
+
+        # --- Initial Knowledge (Bootstrap Recipes) ---
+        self.knowledge.add_recipe('CrudeAxe')
+        self.knowledge.add_recipe('Workbench')
+
+        # --- Phase 4: Social Attributes & State ---
+        self.sociability = random.uniform(0.1, 0.9) # How likely to engage in positive social actions
+        self.pending_signal: Signal | None = None      # Last signal perceived this tick
+        self.reacted_to_signal_type = None # Track if reacted to avoid spamming reactions
+        self.last_passive_learn_check_time = 0.0 # Throttle passive learning checks
+
+
+    def update(self, dt_real_seconds, agents, social_manager):
+        """ Main update loop called each simulation tick. """
+        dt_sim_seconds = dt_real_seconds * cfg.SIMULATION_SPEED_FACTOR
+
+        # 1. Update Needs & Check Health
+        self._update_needs(dt_sim_seconds)
+        if self.health <= 0:
+            self._handle_death()
+            return # Agent is dead
+
+        # 2. Process Social Signals (Phase 4)
+        self._process_signals(agents, social_manager) # React to any perceived signal
+
+        # 3. Decide and Perform Action
+        action_just_chosen = False
+        if not self.current_action:
+            self._choose_action(agents, social_manager)
+            action_just_chosen = True # Don't execute immediately
+
+        if self.current_action and not action_just_chosen:
+            try:
+                action_complete = self._perform_action(dt_sim_seconds, agents, social_manager)
+                if action_complete:
+                    self._complete_action()
+            except Exception as e:
+                print(f"!!! Agent {self.id} CRASH during perform_action {self.current_action}: {e}")
+                traceback.print_exc()
+                self._complete_action() # Reset state
+
+        # 4. Passive Learning Check (Phase 4) - Throttled
+        if self.world.simulation_time - self.last_passive_learn_check_time > 1.0: # Check roughly once per sim sec
+             self._check_passive_learning(agents)
+             self.last_passive_learn_check_time = self.world.simulation_time
+
+
+    def _update_needs(self, dt_sim_seconds):
+        """ Updates agent's health, energy, hunger, and thirst over time. """
+        self.hunger = min(cfg.MAX_HUNGER, self.hunger + cfg.HUNGER_INCREASE_RATE * dt_sim_seconds) # Uses updated config rate
+        self.thirst = min(cfg.MAX_THIRST, self.thirst + cfg.THIRST_INCREASE_RATE * dt_sim_seconds) # Uses updated config rate
+
+        # Energy decay/regen based on action
+        energy_change = 0
+        if self.current_action == "Rest":
+            energy_change = cfg.ENERGY_REGEN_RATE * dt_sim_seconds
+        elif self.current_action is not None: # Any other active action decays energy
+            energy_change = -cfg.ENERGY_DECAY_RATE * dt_sim_seconds
+        # Apply base decay if not resting
+        if self.current_action != "Rest":
+             energy_change -= cfg.ENERGY_DECAY_RATE * dt_sim_seconds # Uses updated config rate
+
+        self.energy = max(0, min(cfg.MAX_ENERGY, self.energy + energy_change))
+
+        # Health regen only while resting and needs mostly met
+        if self.current_action == "Rest" and self.energy > cfg.MAX_ENERGY * 0.5 and self.hunger < cfg.MAX_HUNGER * 0.8 and self.thirst < cfg.MAX_THIRST * 0.8:
+            self.health = min(cfg.MAX_HEALTH, self.health + cfg.HEALTH_REGEN_RATE * dt_sim_seconds) # Uses updated config rate
+
+        # Health drain from critical needs
+        health_drain = 0
+        if self.hunger >= cfg.MAX_HUNGER * 0.95: health_drain += 0.8
+        if self.thirst >= cfg.MAX_THIRST * 0.95: health_drain += 1.0
+        if self.energy <= 0 and self.current_action != "Rest": health_drain += 0.5 # Exhaustion penalty
+        self.health = max(0, self.health - health_drain * dt_sim_seconds)
+
+
+    def _choose_action(self, agents, social_manager):
+        """ Determines the best action based on utility scores. Phase 4 includes social actions. """
+        utilities = {}
+
+        # --- Calculate Utility Scores ---
+        # 1. Basic Needs Utilities
+        # Use the explicit config weights
+        utilities['SatisfyThirst'] = (self.thirst / cfg.MAX_THIRST)**2 * cfg.UTILITY_THIRST_WEIGHT
+        utilities['SatisfyHunger'] = (self.hunger / cfg.MAX_HUNGER)**2 * cfg.UTILITY_HUNGER_WEIGHT
+        energy_deficit = (cfg.MAX_ENERGY - self.energy) / cfg.MAX_ENERGY
+        needs_rest = (self.energy < cfg.MAX_ENERGY * 0.3 or
+                      (self.health < cfg.MAX_HEALTH * 0.8 and self.hunger < cfg.MAX_HUNGER * 0.8 and self.thirst < cfg.MAX_THIRST * 0.8))
+        utilities['Rest'] = (energy_deficit**2) * 1.1 if needs_rest else 0
+
+        # 2. Resource, Crafting, Invention Utilities
+        has_axe = self.inventory.get('CrudeAxe', 0) > 0
+        has_pick = self.inventory.get('StonePick', 0) > 0
+        current_wood = self.inventory.get('Wood', 0)
+        current_stone = self.inventory.get('Stone', 0)
+        inventory_full = sum(self.inventory.values()) >= cfg.INVENTORY_CAPACITY
+        needs_met_factor = max(0, 1 - max(utilities.get('SatisfyThirst',0), utilities.get('SatisfyHunger',0), utilities.get('Rest',0)))
+        is_at_workbench = self._is_at_workbench()
+
+        # Calculate resource needs
+        wood_needed_for_crafts = 0; stone_needed_for_crafts = 0
+        workbench_required_by_known_craft = False; can_make_something_at_workbench = False
+        for recipe_name in self.knowledge.known_recipes:
+            details = cfg.RECIPES.get(recipe_name)
+            if not details or not self._has_skill_for(details): continue
+            want_item = False
+            if recipe_name == 'Workbench' and not self._has_workbench_knowledge(): want_item = True
+            elif recipe_name == 'StonePick' and not has_pick: want_item = True
+            elif recipe_name == 'CrudeAxe' and not has_axe: want_item = True
+            elif recipe_name == 'CookedFood' and self.inventory.get('Food', 0) > 0 : want_item = True
+
+            if want_item:
+                ingredients = details.get('ingredients', {})
+                wood_needed_for_crafts = max(wood_needed_for_crafts, ingredients.get('Wood', 0) - current_wood)
+                stone_needed_for_crafts = max(stone_needed_for_crafts, ingredients.get('Stone', 0) - current_stone)
+                if details.get('workbench', False):
+                     workbench_required_by_known_craft = True
+                     if self._has_ingredients(ingredients): can_make_something_at_workbench = True
+
+        stockpile_wood_goal = 5; stockpile_stone_goal = 3
+        total_wood_need = max(wood_needed_for_crafts, stockpile_wood_goal if needs_met_factor > 0.6 else 0)
+        total_stone_need = max(stone_needed_for_crafts, stockpile_stone_goal if needs_met_factor > 0.6 else 0)
+
+        # Gathering Utilities
+        if not inventory_full and total_wood_need > current_wood:
+            wood_need_norm = min(1, (total_wood_need - current_wood) / total_wood_need if total_wood_need > 0 else 0)
+            tool_mult = cfg.TOOL_EFFICIENCY['CrudeAxe'] if has_axe else 1.0
+            utilities['GatherWood'] = wood_need_norm * 0.4 * self._get_skill_multiplier('GatherWood') * tool_mult * needs_met_factor
+        if not inventory_full and total_stone_need > current_stone:
+            stone_need_norm = min(1, (total_stone_need - current_stone) / total_stone_need if total_stone_need > 0 else 0)
+            tool_mult = cfg.TOOL_EFFICIENCY.get('StonePick', 1.0) if has_pick else 1.0
+            utilities['GatherStone'] = stone_need_norm * 0.35 * self._get_skill_multiplier('GatherStone') * tool_mult * needs_met_factor
+
+        # Crafting Utility
+        best_craft_utility = 0; best_craft_recipe = None
+        for recipe_name in self.knowledge.known_recipes:
+            details = cfg.RECIPES.get(recipe_name); utility = 0.0
+            if not details: continue
+            can_craft_now = False
+            if self._has_ingredients(details['ingredients']) and self._has_skill_for(details):
+                if details.get('workbench', False): can_craft_now = is_at_workbench
+                else: can_craft_now = True
+            if can_craft_now:
+                utility = 0.3 * needs_met_factor * self._get_skill_multiplier(details.get('skill')) # Base utility
+                if recipe_name == 'CrudeAxe' and not has_axe: utility = 0.75
+                if recipe_name == 'StonePick' and not has_pick: utility = 0.70
+                if recipe_name == 'Workbench' and not self._has_workbench_knowledge(): utility = 0.80
+                if recipe_name == 'CookedFood' and self.hunger > cfg.MAX_HUNGER * 0.5: utility = 0.65
+                if utility > best_craft_utility:
+                    best_craft_utility = utility; best_craft_recipe = recipe_name
+        if best_craft_recipe: utilities['Craft:' + best_craft_recipe] = best_craft_utility
+
+        # GoToWorkbench Utility
+        reason_for_workbench = None
+        if can_make_something_at_workbench: reason_for_workbench = "Craft"
+        can_invent = (needs_met_factor > 0.7 and len(self.inventory) >= cfg.INVENTION_ITEM_TYPES_THRESHOLD and not inventory_full)
+        if can_invent and not reason_for_workbench: reason_for_workbench = "Invent"
+        if reason_for_workbench and not is_at_workbench:
+             if self._has_workbench_knowledge():
+                  utility = 0.65 if reason_for_workbench == "Craft" else 0.45
+                  utilities['GoToWorkbench:' + reason_for_workbench] = utility * needs_met_factor
+
+        # Invention Utility
+        if is_at_workbench and can_invent:
+             utility = 0.35 * self.intelligence * needs_met_factor
+             if self.current_action and self.current_action.startswith("Craft"): utility *= 0.5
+             utilities['Invent'] = utility
+
+        # --- Phase 4: Social Action Utilities ---
+        # 3. Signaling Utility
+        best_signal_utility = 0; best_signal_type = None
+        if self.hunger > cfg.MAX_HUNGER * cfg.HELPING_TARGET_NEED_THRESHOLD:
+             utility = (self.hunger / cfg.MAX_HUNGER) * 0.8 * self.sociability
+             if utility > best_signal_utility: best_signal_utility = utility; best_signal_type = cfg.SIGNAL_HELP_NEEDED_FOOD
+        # Add other signal triggers here if desired
+
+        if best_signal_type:
+            # <<< Adjusted utility factor to rely less on perfect needs state >>>
+            signal_utility_factor = max(0.1, 0.2 + needs_met_factor * 0.8)
+            utilities[f"Signal:{best_signal_type}"] = best_signal_utility * signal_utility_factor
+
+        # 4. Helping Utility
+        best_help_utility = 0; best_help_target = None; best_help_item = None
+        # Use the relaxed self-need threshold from config
+        can_consider_helping = (self.hunger < cfg.MAX_HUNGER * cfg.HELPING_SELF_NEED_THRESHOLD and \
+                                self.thirst < cfg.MAX_THIRST * cfg.HELPING_SELF_NEED_THRESHOLD and \
+                                self.energy > cfg.MAX_ENERGY * 0.3)
+
+        if can_consider_helping:
+            available_help_items = [item for item in cfg.HELPABLE_ITEMS if self.inventory.get(item, 0) > 0]
+            if available_help_items: # Only check agents if have items
+                nearby_agents = self._find_nearby_agents(agents, cfg.HELPING_INTERACTION_RADIUS)
+                for other in nearby_agents:
+                     rel = self.knowledge.get_relationship(other.id)
+                     if rel < cfg.HELPING_MIN_RELATIONSHIP: continue # Use updated config
+
+                     needs_help = False; item_to_give = None; need_severity = 0
+                     if other.hunger > cfg.MAX_HUNGER * cfg.HELPING_TARGET_NEED_THRESHOLD:
+                          item_to_give = available_help_items[0]; needs_help = True
+                          need_severity = (other.hunger / cfg.MAX_HUNGER)
+                     # Add health check later
+
+                     if needs_help and item_to_give:
+                          # <<< Adjusted utility factor to be less penalized by own needs >>>
+                          utility = need_severity * (rel + 1.1) * self.sociability * 0.75 # Increased base slightly more
+                          help_utility_factor = max(0.2, 0.4 + needs_met_factor * 0.6) # Ensure minimum floor
+                          final_utility = utility * help_utility_factor
+
+                          if final_utility > best_help_utility:
+                               best_help_utility = final_utility; best_help_target = other.id; best_help_item = item_to_give
+
+                if best_help_target and best_help_item:
+                     utilities[f"Help:{best_help_target}:{best_help_item}"] = best_help_utility
+
+        # 5. Teaching Utility
+        best_teach_utility = 0; best_teach_target = None; best_teach_skill = None
+        can_consider_teaching = (self.hunger < cfg.MAX_HUNGER * 0.7 and \
+                                 self.thirst < cfg.MAX_THIRST * 0.7 and \
+                                 self.energy > cfg.MAX_ENERGY * 0.4)
+
+        if can_consider_teaching:
+             nearby_agents_teach = self._find_nearby_agents(agents, cfg.TEACHING_INTERACTION_RADIUS)
+             for other in nearby_agents_teach:
+                 rel = self.knowledge.get_relationship(other.id)
+                 if rel < cfg.TEACHING_MIN_RELATIONSHIP: continue # Use updated config
+
+                 for skill_name, my_level in self.skills.items():
+                      other_level = other.skills.get(skill_name, 0)
+                      # Use updated config skill advantage
+                      if my_level > cfg.TEACHING_MIN_SKILL_ADVANTAGE and \
+                         my_level > other_level + cfg.TEACHING_MIN_SKILL_ADVANTAGE and \
+                         other_level < cfg.MAX_SKILL_LEVEL * 0.6:
+                           skill_gap_factor = (my_level - other_level) / cfg.MAX_SKILL_LEVEL
+                           # <<< Adjusted utility factor >>>
+                           utility = skill_gap_factor * (rel + 1.1) * self.sociability * 0.50 # Increased base utility more
+                           teach_utility_factor = max(0.25, 0.5 + needs_met_factor * 0.5) # Higher minimum floor
+                           final_utility = utility * teach_utility_factor
+
+                           if final_utility > best_teach_utility:
+                                best_teach_utility = final_utility; best_teach_target = other.id; best_teach_skill = skill_name
+                                break # Teach first suitable skill found for this agent
+
+             if best_teach_target and best_teach_skill:
+                  utilities[f"Teach:{best_teach_target}:{best_teach_skill}"] = best_teach_utility
+
+
+        # --- Default Action Utility ---
+        utilities['Wander'] = 0.05 * needs_met_factor * (1.0 - self.intelligence * 0.5)
+
+
+        # --- Selection Process ---
+        best_action = None; max_utility = -1; self.action_target = None
+        sorted_utilities = sorted(utilities.items(), key=lambda item: item[1] + random.uniform(-0.01, 0.01), reverse=True)
+
+        if cfg.DEBUG_AGENT_AI: print(f"Agent {self.id} Utilities: {[(a, f'{u:.2f}') for a, u in sorted_utilities if u > 0.01]}")
+
+        for action, utility in sorted_utilities:
+            if utility <= cfg.UTILITY_THRESHOLD and 'Wander' not in action: continue
+
+            feasible, target_data = self._check_action_feasibility(action, agents)
+            if feasible:
+                best_action = action; max_utility = utility; self.action_target = target_data
+                if cfg.DEBUG_AGENT_CHOICE: print(f"Agent {self.id} PRE-SELECTED: {best_action} (Util: {max_utility:.2f}) Target: {target_data}")
+                break
+
+        if not best_action:
+            feasible, target_data = self._check_action_feasibility('Wander', agents)
+            if feasible: best_action = 'Wander'; max_utility = utilities.get('Wander', 0.05); self.action_target = target_data
+            else: best_action = "Idle"; max_utility = 0; self.action_target = None
+
+
+        # --- Log Chosen Action and Initiate ---
+        if cfg.DEBUG_AGENT_CHOICE:
+            inv_sum = sum(self.inventory.values()); known_recipes_count = len(self.knowledge.known_recipes)
+            skills_str = {k: f"{v:.1f}" for k, v in self.skills.items() if v > 0.1}
+            rels_str = {id: f"{s:.1f}" for id, s in self.knowledge.relationships.items()}
+            print(f"Agent {self.id} choosing: {best_action} (Util: {max_utility:.2f}) Needs(Hl,H,T,E): ({self.health:.0f},{self.hunger:.0f},{self.thirst:.0f},{self.energy:.0f}) Inv: {inv_sum} Recipes: {known_recipes_count} Soc:{self.sociability:.1f} Skills: {skills_str} Rels: {rels_str}")
+
+        self.current_action = best_action
+        self.current_path = []; self.action_timer = 0.0
+        if best_action == "Idle": self.action_target = None; return
+
+        self._plan_path_for_action(agents)
+
+
+    def _plan_path_for_action(self, agents):
+        """ Plans path for chosen action. Sets self.current_path or reverts to Idle. """
+        target_setup_success = False; best_action = self.current_action
+        if not self.action_target:
+            print(f"Agent {self.id}: Critical Error - Action {best_action} chosen but action_target is None!")
+            self.current_action = "Idle"; return
+
+        try:
+            stand_pos = self.action_target.get('stand')
+            current_pos = (self.x, self.y)
+
+            if stand_pos: # Action requires movement to a specific standing spot
+                if current_pos == stand_pos: target_setup_success = True; self.current_path = []
+                else:
+                    self.current_path = self._plan_path(stand_pos, agents)
+                    if self.current_path is not None: target_setup_success = True
+                    else:
+                         if cfg.DEBUG_PATHFINDING: print(f"Agent {self.id}: Path planning failed for {best_action} to {stand_pos}.")
+                         target_setup_success = False
+            else: # Action happens locally or target position is determined differently
+                action_type = best_action.split(':')[0]
+                needs_stand_pos = action_type in ['GatherWood', 'GatherStone', 'SatisfyHunger', 'SatisfyThirst', 'GoToWorkbench'] \
+                                  or (action_type == 'Craft' and self.action_target.get('requires_workbench')) \
+                                  or action_type in ['Help', 'Teach']
+
+                if needs_stand_pos and not self.action_target.get('goal'):
+                     print(f"Agent {self.id}: Warning - Action {best_action} might need stand pos, but none/no goal found in target: {self.action_target}")
+                     target_setup_success = True; self.current_path = [] # Assume local ok if feasibility passed
+                elif not needs_stand_pos: # Truly local actions
+                     target_setup_success = True; self.current_path = []
+                else:
+                     print(f"Agent {self.id}: Critical error - Action {best_action} requires 'stand' pos but none found in target data: {self.action_target}")
+                     target_setup_success = False
+
+        except Exception as e:
+             print(f"!!! Error during action path planning setup for Agent {self.id}, Action: {best_action}: {e}"); traceback.print_exc()
+             target_setup_success = False
+
+        if not target_setup_success:
+             if cfg.DEBUG_AGENT_CHOICE or cfg.DEBUG_PATHFINDING: print(f"Agent {self.id}: Failed to initiate action {best_action} (pathing/target setup failed). Reverting to Idle.")
+             self._complete_action()
+
+
+    def _check_action_feasibility(self, action_name, agents):
+        """ Checks if an action is possible *right now*. Returns (bool feasible, dict target_data). Phase 4 checks added. """
+        target_data = {'type': action_name.split(':')[0]}
+        goal_pos, stand_pos, dist = None, None, float('inf')
+
+        # Needs, Gathering, Crafting, GoToWorkbench, Invent, Wander, Idle, Rest (Unchanged logic, relies on updated Config)
+        if action_name == 'SatisfyThirst':
+            goal_pos, stand_pos, dist = self._find_best_resource_location(cfg.RESOURCE_WATER)
+            if stand_pos: target_data.update({'goal': goal_pos, 'stand': stand_pos}); return True, target_data
+        elif action_name == 'SatisfyHunger':
+            goal_pos, stand_pos, dist = self._find_best_resource_location(cfg.RESOURCE_FOOD)
+            if stand_pos: target_data.update({'goal': goal_pos, 'stand': stand_pos}); return True, target_data
+        elif action_name == 'GatherWood':
+            if sum(self.inventory.values()) >= cfg.INVENTORY_CAPACITY: return False, None
+            goal_pos, stand_pos, dist = self._find_best_resource_location(cfg.RESOURCE_WOOD)
+            if stand_pos: target_data.update({'goal': goal_pos, 'stand': stand_pos}); return True, target_data
+        elif action_name == 'GatherStone':
+            if sum(self.inventory.values()) >= cfg.INVENTORY_CAPACITY: return False, None
+            goal_pos, stand_pos, dist = self._find_best_resource_location(cfg.RESOURCE_STONE)
+            if stand_pos: target_data.update({'goal': goal_pos, 'stand': stand_pos}); return True, target_data
+        elif action_name.startswith('Craft:'):
+             recipe_name = action_name.split(':')[1]; details = cfg.RECIPES.get(recipe_name)
+             if not details or not self.knowledge.knows_recipe(recipe_name) or not self._has_ingredients(details['ingredients']) or not self._has_skill_for(details): return False, None
+             req_wb = details.get('workbench', False)
+             target_data.update({'recipe': recipe_name, 'requires_workbench': req_wb})
+             if req_wb:
+                 if not self._is_at_workbench(): return False, None
+                 wb_pos = self._get_nearby_workbench_pos()
+                 if not wb_pos: return False, None
+                 goal_pos = wb_pos; stand_pos = (self.x, self.y)
+             else: goal_pos = (self.x, self.y); stand_pos = (self.x, self.y)
+             target_data.update({'goal': goal_pos, 'stand': stand_pos}); return True, target_data
+        elif action_name.startswith('GoToWorkbench:'):
+             purpose = action_name.split(':')[1]
+             if self._is_at_workbench(): return False, None
+             goal_pos, stand_pos, dist = self._find_best_resource_location(cfg.RESOURCE_WORKBENCH)
+             if stand_pos: target_data.update({'goal': goal_pos, 'stand': stand_pos, 'purpose': purpose}); return True, target_data
+        elif action_name == 'Invent':
+             if not self._is_at_workbench(): return False, None
+             if len(self.inventory) < cfg.INVENTION_ITEM_TYPES_THRESHOLD: return False, None
+             if sum(self.inventory.values()) >= cfg.INVENTORY_CAPACITY: return False, None
+             wb_pos = self._get_nearby_workbench_pos()
+             if wb_pos: target_data.update({'goal': wb_pos, 'stand': (self.x, self.y)}); return True, target_data
+             else: return False, None
+        elif action_name == 'Wander':
+             for _ in range(10):
+                  wx = max(0, min(self.world.width - 1, self.x + random.randint(-cfg.WANDER_RADIUS, cfg.WANDER_RADIUS)))
+                  wy = max(0, min(self.world.height - 1, self.y + random.randint(-cfg.WANDER_RADIUS, cfg.WANDER_RADIUS)))
+                  if self.world.walkability_matrix[wy, wx] == 1 and self.world.terrain_map[wy,wx] == cfg.TERRAIN_GROUND:
+                       stand_pos = (wx, wy); break
+             else: stand_pos = self._find_adjacent_walkable(self.x, self.y, self.world.walkability_matrix)
+             if stand_pos: target_data.update({'goal': stand_pos, 'stand': stand_pos}); return True, target_data
+        elif action_name == "Idle": return True, {'type': 'Idle'}
+        elif action_name == "Rest":
+            if self.hunger < cfg.MAX_HUNGER * 0.95 and self.thirst < cfg.MAX_THIRST * 0.95:
+                 target_data['stand'] = (self.x, self.y); return True, target_data
+
+
+        # --- Phase 4: Social Action Feasibility ---
+        elif action_name.startswith('Signal:'):
+             signal_type = action_name.split(':')[1]
+             known_signals = [cfg.SIGNAL_HELP_NEEDED_FOOD, cfg.SIGNAL_HELP_NEEDED_HEALTH, cfg.SIGNAL_FOUND_FOOD, cfg.SIGNAL_FOUND_WATER, cfg.SIGNAL_DANGER_NEAR]
+             if signal_type in known_signals:
+                 target_data['signal_type'] = signal_type
+                 target_data['stand'] = (self.x, self.y); target_data['goal'] = (self.x, self.y)
+                 return True, target_data
+
+        elif action_name.startswith('Help:'):
+             parts = action_name.split(':');
+             if len(parts) != 3: return False, None
+             _, target_id_str, item_name = parts
+             try: target_id = int(target_id_str)
+             except ValueError: return False, None
+             target_agent = self.world.get_agent_by_id(target_id)
+             if not target_agent or target_agent.health <= 0: return False, None
+
+             # Check conditions using updated config values
+             if self.inventory.get(item_name, 0) <= 0: return False, None
+             if item_name not in cfg.HELPABLE_ITEMS: return False, None
+             dist_sq = (self.x - target_agent.x)**2 + (self.y - target_agent.y)**2
+             if dist_sq > cfg.HELPING_INTERACTION_RADIUS**2: return False, None
+             if self.knowledge.get_relationship(target_id) < cfg.HELPING_MIN_RELATIONSHIP: return False, None
+             # <<< Use RELAXED self-need threshold from config >>>
+             if self.hunger > cfg.MAX_HUNGER * cfg.HELPING_SELF_NEED_THRESHOLD or \
+                self.thirst > cfg.MAX_THIRST * cfg.HELPING_SELF_NEED_THRESHOLD: return False, None
+
+             target_data.update({'target_id': target_id, 'item': item_name})
+             target_data['goal'] = (target_agent.x, target_agent.y)
+             stand_pos = self._find_stand_pos_for_agent(target_agent.x, target_agent.y, agents)
+             if stand_pos: target_data['stand'] = stand_pos; return True, target_data
+             else: return False, None
+
+        elif action_name.startswith('Teach:'):
+            parts = action_name.split(':');
+            if len(parts) != 3: return False, None
+            _, target_id_str, skill_name = parts
+            try: target_id = int(target_id_str)
+            except ValueError: return False, None
+            target_agent = self.world.get_agent_by_id(target_id)
+            if not target_agent or target_agent.health <= 0: return False, None
+
+            # Check conditions using updated config values
+            if skill_name not in self.skills: return False, None
+            my_level = self.skills[skill_name]
+            other_level = target_agent.skills.get(skill_name, 0)
+            if my_level < cfg.TEACHING_MIN_SKILL_ADVANTAGE or \
+               my_level < other_level + cfg.TEACHING_MIN_SKILL_ADVANTAGE: return False, None
+            dist_sq = (self.x - target_agent.x)**2 + (self.y - target_agent.y)**2
+            if dist_sq > cfg.TEACHING_INTERACTION_RADIUS**2: return False, None
+            if self.knowledge.get_relationship(target_id) < cfg.TEACHING_MIN_RELATIONSHIP: return False, None
+            if self.energy < cfg.MAX_ENERGY * 0.4 or self.hunger > cfg.MAX_HUNGER * 0.7 or self.thirst > cfg.MAX_THIRST * 0.7: return False, None
+
+            target_data.update({'target_id': target_id, 'skill': skill_name})
+            target_data['goal'] = (target_agent.x, target_agent.y)
+            stand_pos = self._find_stand_pos_for_agent(target_agent.x, target_agent.y, agents)
+            if stand_pos: target_data['stand'] = stand_pos; return True, target_data
+            else: return False, None
+
+        return False, None # Default: action not feasible
+
+
+    def _perform_action(self, dt_sim_seconds, agents, social_manager):
+        """ Executes the current action step, returns True if completed. Phase 4 actions added. """
+        if not self.current_action or self.current_action == "Idle": return True
+
+        # --- 1. Movement Phase ---
+        if self.current_path:
+            next_pos = self.current_path[0]; nx, ny = next_pos
+            other_agent_positions = [(a.x, a.y) for a in agents if a != self and a.health > 0]
+            temp_walkability = self.world.update_walkability(agent_positions=other_agent_positions)
+
+            if temp_walkability[ny, nx] == 0:
+                stand_pos = self.action_target.get('stand')
+                goal_pos = self.action_target.get('goal')
+                final_target = stand_pos if stand_pos else goal_pos
+                if final_target:
+                    if cfg.DEBUG_PATHFINDING: print(f"Agent {self.id}: Path blocked at {next_pos}. Re-planning to {final_target}.")
+                    new_path = self._plan_path(final_target, agents)
+                    if new_path is not None:
+                         self.current_path = new_path
+                         if not new_path and (self.x, self.y) != final_target:
+                              if cfg.DEBUG_PATHFINDING: print(f"Agent {self.id}: Replan resulted in empty path, but not at target {final_target}. Waiting.")
+                              return False # Wait
+                         elif new_path:
+                              return False # Continue moving
+                    else:
+                         if cfg.DEBUG_AGENT_ACTIONS: print(f"Agent {self.id}: Failed replan around block for {self.current_action}. Failing action.")
+                         return True # Fail
+                else:
+                    print(f"Agent {self.id}: Path blocked for {self.current_action}, no stand/goal pos to replan! Failing.")
+                    return True # Fail
+            else: # Move is clear
+                self.x = nx; self.y = ny
+                self.energy -= cfg.MOVE_ENERGY_COST # Use updated config cost
+                self.current_path.pop(0)
+                if self.current_path: return False # Still moving
+
+        # --- 2. Action Execution Phase ---
+        action_type = self.current_action.split(':')[0]
+        # --- Use the REVISED verification logic ---
+        if not self._verify_position_for_action(action_type, agents):
+             if cfg.DEBUG_AGENT_ACTIONS: print(f"Agent {self.id}: Failed position verification for {self.current_action} after pathing. Failing.")
+             return True
+
+        self.action_timer += dt_sim_seconds
+
+        # --- Action Logic ---
+        try:
+            # Basic Needs & Resource Gathering, Crafting, GoToWorkbench, Invent (Uses updated config values implicitly)
+            if action_type == 'SatisfyThirst':
+                drink_duration = cfg.DRINK_THIRST_REDUCTION / 25 # Faster drinking if more thirst reduced? Or keep const? Let's keep const for now.
+                # drink_duration = 2.5 # Fixed duration example
+                if self.action_timer >= drink_duration:
+                    self.thirst = max(0, self.thirst - cfg.DRINK_THIRST_REDUCTION); self.energy -= cfg.MOVE_ENERGY_COST * 0.1
+                    if cfg.DEBUG_AGENT_ACTIONS: print(f"Agent {self.id} drank. Thirst: {self.thirst:.1f}")
+                    goal_pos = self.action_target.get('goal');
+                    if goal_pos: self.knowledge.add_resource_location(cfg.RESOURCE_WATER, goal_pos[0], goal_pos[1])
+                    return True
+                else: return False
+            elif action_type == 'SatisfyHunger':
+                goal_pos = self.action_target['goal']; resource = self.world.get_resource(goal_pos[0], goal_pos[1])
+                eat_duration = cfg.EAT_HUNGER_REDUCTION / 25 # Faster eating if more hunger reduced?
+                # eat_duration = 2.0 # Fixed duration example
+                if not resource or resource.is_depleted():
+                     self.knowledge.remove_resource_location(cfg.RESOURCE_FOOD, goal_pos[0], goal_pos[1]); return True
+                if self.action_timer >= eat_duration:
+                    amount_eaten = self.world.consume_resource_at(goal_pos[0], goal_pos[1], 1)
+                    if amount_eaten > 0:
+                        self.hunger = max(0, self.hunger - cfg.EAT_HUNGER_REDUCTION); self.energy -= cfg.MOVE_ENERGY_COST * 0.1
+                        if cfg.DEBUG_AGENT_ACTIONS: print(f"Agent {self.id} ate raw food. Hunger: {self.hunger:.1f}")
+                        self.knowledge.add_resource_location(cfg.RESOURCE_FOOD, goal_pos[0], goal_pos[1])
+                        if resource.is_depleted(): self.knowledge.remove_resource_location(cfg.RESOURCE_FOOD, goal_pos[0], goal_pos[1])
+                    else: self.knowledge.remove_resource_location(cfg.RESOURCE_FOOD, goal_pos[0], goal_pos[1])
+                    return True
+                else: return False
+            elif action_type == 'Rest':
+                if self.energy >= cfg.MAX_ENERGY or self.thirst > cfg.MAX_THIRST * 0.9 or self.hunger > cfg.MAX_HUNGER * 0.9: return True
+                return False # Continue resting
+            elif action_type == 'Wander': return True # Completes instantly upon arrival
+            elif action_type == 'GatherWood' or action_type == 'GatherStone':
+                 is_wood = action_type == 'GatherWood'; res_type = cfg.RESOURCE_WOOD if is_wood else cfg.RESOURCE_STONE
+                 skill = 'GatherWood' if is_wood else 'GatherStone'; tool = 'CrudeAxe' if is_wood else 'StonePick'
+                 res_name = 'Wood' if is_wood else 'Stone'
+                 goal_pos = self.action_target['goal']; resource = self.world.get_resource(goal_pos[0], goal_pos[1])
+                 if not resource or resource.is_depleted() or resource.type != res_type:
+                      self.knowledge.remove_resource_location(res_type, goal_pos[0], goal_pos[1]); return True
+                 tool_mult = cfg.TOOL_EFFICIENCY.get(tool, 1.0) if self.inventory.get(tool, 0) > 0 else 1.0
+                 skill_mult = self._get_skill_multiplier(skill)
+                 duration = cfg.GATHER_BASE_DURATION / (skill_mult * tool_mult)
+                 if self.action_timer >= duration:
+                     amount = self.world.consume_resource_at(goal_pos[0], goal_pos[1], 1)
+                     if amount > 0:
+                         self.inventory[res_name] = self.inventory.get(res_name, 0) + amount; self.energy -= cfg.GATHER_ENERGY_COST / tool_mult # Use updated cost
+                         learned = self.learn_skill(skill)
+                         if cfg.DEBUG_AGENT_ACTIONS: print(f"Agent {self.id} gathered {amount} {res_name} (Skill:{self.skills[skill]:.1f}{'+' if learned else ''}). Total: {self.inventory.get(res_name)}")
+                         self.action_timer = 0; self.knowledge.add_resource_location(res_type, goal_pos[0], goal_pos[1])
+                         inv_full = sum(self.inventory.values()) >= cfg.INVENTORY_CAPACITY; low_e = self.energy < cfg.GATHER_ENERGY_COST * 1.5; gone = resource.is_depleted()
+                         if inv_full or low_e or gone:
+                              if gone: self.knowledge.remove_resource_location(res_type, goal_pos[0], goal_pos[1])
+                              if cfg.DEBUG_AGENT_ACTIONS: print(f"Agent {self.id} finished gathering {res_name} (Full:{inv_full}, LowE:{low_e}, Gone:{gone}).")
+                              return True
+                         else: return False # Continue gathering
+                     else: self.knowledge.remove_resource_location(res_type, goal_pos[0], goal_pos[1]); return True
+                 else: return False
+            elif action_type == 'Craft':
+                 recipe_name = self.action_target['recipe']; details = cfg.RECIPES[recipe_name]
+                 skill_req = details.get('skill'); skill_mult = self._get_skill_multiplier(skill_req)
+                 duration = cfg.CRAFT_BASE_DURATION / skill_mult
+                 if self.action_timer >= duration:
+                     if not self._has_ingredients(details['ingredients']) or not self._has_skill_for(details): return True # Final check fail
+                     for item, count in details['ingredients'].items():
+                         self.inventory[item] = self.inventory.get(item, 0) - count
+                         if self.inventory[item] <= 0: del self.inventory[item]
+                     if recipe_name == 'Workbench':
+                          wb_obj = Resource(cfg.RESOURCE_WORKBENCH, self.x, self.y)
+                          if self.world.add_world_object(wb_obj, self.x, self.y):
+                               self.knowledge.add_resource_location(cfg.RESOURCE_WORKBENCH, self.x, self.y)
+                               if cfg.DEBUG_AGENT_ACTIONS: print(f"Agent {self.id} crafted and placed Workbench at ({self.x}, {self.y}).")
+                          else: print(f"Agent {self.id} crafted Workbench but FAILED TO PLACE at ({self.x}, {self.y}). Ingredients lost!")
+                     elif recipe_name == 'CookedFood':
+                          self.inventory['CookedFood'] = self.inventory.get('CookedFood', 0) + 1
+                          if cfg.DEBUG_AGENT_ACTIONS: print(f"Agent {self.id} crafted CookedFood.")
+                     else:
+                          self.inventory[recipe_name] = self.inventory.get(recipe_name, 0) + 1
+                          if cfg.DEBUG_AGENT_ACTIONS: print(f"Agent {self.id} crafted {recipe_name}. Have: {self.inventory.get(recipe_name)}")
+                     self.energy -= cfg.CRAFT_ENERGY_COST; learned = self.learn_skill(skill_req) # Use updated cost
+                     if cfg.DEBUG_AGENT_ACTIONS and skill_req: print(f"  -> Skill '{skill_req}': {self.skills.get(skill_req, 0):.1f} {'+' if learned else ''}")
+                     self.knowledge.add_recipe(recipe_name)
+                     return True
+                 else: return False
+            elif action_type == 'GoToWorkbench':
+                 if self._is_at_workbench():
+                     if cfg.DEBUG_AGENT_ACTIONS: print(f"Agent {self.id} arrived at Workbench {self.action_target.get('goal')} for purpose: {self.action_target.get('purpose', 'N/A')}")
+                     wb_pos = self._get_nearby_workbench_pos();
+                     if wb_pos: self.knowledge.add_resource_location(cfg.RESOURCE_WORKBENCH, wb_pos[0], wb_pos[1])
+                     return True
+                 else: print(f"Agent {self.id} finished path for GoToWorkbench but isn't at WB. Target: {self.action_target.get('goal')}. Failing."); return True
+            elif action_type == 'Invent':
+                 duration = cfg.INVENT_BASE_DURATION / self.intelligence
+                 if self.action_timer >= duration:
+                     if cfg.DEBUG_INVENTION: print(f"Agent {self.id} finishing invention cycle.")
+                     discovered = self.knowledge.attempt_invention(self.inventory, self.skills); self.energy -= cfg.INVENT_ENERGY_COST # Use updated cost
+                     if discovered: print(f"Agent {self.id} successfully invented: {discovered}!")
+                     else: print(f"Agent {self.id} tried to invent but discovered nothing.")
+                     return True
+                 else: return False
+
+            # --- Phase 4: Social Action Execution --- (Uses updated costs implicitly)
+            elif action_type == 'Signal':
+                signal_type = self.action_target.get('signal_type')
+                if signal_type:
+                    social_manager.broadcast_signal(self, signal_type, (self.x, self.y))
+                    self.energy -= cfg.SIGNAL_ENERGY_COST
+                    if cfg.DEBUG_SOCIAL: print(f"Agent {self.id} executed Signal:{signal_type}")
+                else: print(f"Agent {self.id}: Error - Signal action target missing signal_type.")
+                return True # Signal is instantaneous
+
+            elif action_type == 'Help':
+                 target_id = self.action_target.get('target_id'); item_name = self.action_target.get('item')
+                 target_agent = self.world.get_agent_by_id(target_id)
+                 if not target_agent or target_agent.health <= 0: print(f"Agent {self.id}: Help target {target_id} invalid/dead."); return True
+                 if self.inventory.get(item_name, 0) <= 0: print(f"Agent {self.id}: Help item {item_name} missing."); return True
+                 dist_sq = (self.x - target_agent.x)**2 + (self.y - target_agent.y)**2
+                 if dist_sq > cfg.HELPING_INTERACTION_RADIUS**2: print(f"Agent {self.id}: Help target {target_id} moved out of range."); return True
+
+                 if self.action_timer >= cfg.HELP_BASE_DURATION:
+                      self.inventory[item_name] -= 1
+                      if self.inventory[item_name] <= 0: del self.inventory[item_name]
+                      target_agent.inventory[item_name] = target_agent.inventory.get(item_name, 0) + 1
+                      self.energy -= cfg.HELP_ENERGY_COST
+
+                      self.knowledge.update_relationship(target_id, cfg.RELATIONSHIP_CHANGE_HELP)
+                      target_agent.knowledge.update_relationship(self.id, cfg.RELATIONSHIP_CHANGE_HELP)
+
+                      if cfg.DEBUG_SOCIAL: print(f"Agent {self.id} successfully helped Agent {target_id} by giving {item_name}.")
+                      if target_agent.reacted_to_signal_type == cfg.SIGNAL_HELP_NEEDED_FOOD and item_name in cfg.HELPABLE_ITEMS:
+                           self.knowledge.update_relationship(target_id, cfg.RELATIONSHIP_CHANGE_SIGNAL_RESPONSE)
+                           target_agent.reacted_to_signal_type = None
+
+                      return True
+                 else: return False
+
+            elif action_type == 'Teach':
+                 target_id = self.action_target.get('target_id'); skill_name = self.action_target.get('skill')
+                 target_agent = self.world.get_agent_by_id(target_id)
+                 if not target_agent or target_agent.health <= 0: print(f"Agent {self.id}: Teach target {target_id} invalid/dead."); return True
+                 my_level = self.skills.get(skill_name, 0)
+                 other_level = target_agent.skills.get(skill_name, 0)
+                 if my_level < other_level + cfg.TEACHING_MIN_SKILL_ADVANTAGE: print(f"Agent {self.id}: Teach skill advantage lost for {skill_name}."); return True
+                 dist_sq = (self.x - target_agent.x)**2 + (self.y - target_agent.y)**2
+                 if dist_sq > cfg.TEACHING_INTERACTION_RADIUS**2: print(f"Agent {self.id}: Teach target {target_id} moved out of range."); return True
+
+                 teach_duration = cfg.TEACH_BASE_DURATION / max(0.5, self.intelligence)
+                 if self.action_timer >= teach_duration:
+                     boost = cfg.TEACHING_BOOST_FACTOR * max(0.5, self.intelligence)
+                     learned = target_agent.learn_skill(skill_name, boost=boost)
+                     self.energy -= cfg.TEACH_ENERGY_COST
+
+                     self.knowledge.update_relationship(target_id, cfg.RELATIONSHIP_CHANGE_TEACH)
+                     target_agent.knowledge.update_relationship(self.id, cfg.RELATIONSHIP_CHANGE_TEACH)
+
+                     if cfg.DEBUG_SOCIAL:
+                          print(f"Agent {self.id} (Skill:{my_level:.1f}) finished teaching {skill_name} to Agent {target_id} (Skill:{target_agent.skills.get(skill_name,0):.1f}, Learned: {learned})")
+                     return True
+                 else: return False # Still teaching
+
+            else: # Fallback for unknown action types
+                print(f"Agent {self.id}: Unknown action execution: {self.current_action}")
+                return True
+
+        except Exception as e: # General error handling during action logic
+            print(f"!!! Error performing action logic {self.current_action} for agent {self.id}: {e}"); traceback.print_exc()
+            return True # Fail action to prevent loops
+
+
+    # --- REVISED _verify_position_for_action ---
+    def _verify_position_for_action(self, action_type, agents):
+        """ Checks if the agent is in the correct location to start/continue the action. Ver 3: Explicit adjacency check. """
+        current_pos = (self.x, self.y)
+        expected_stand_pos = self.action_target.get('stand') if self.action_target else None
+        goal_pos = self.action_target.get('goal') if self.action_target else None
+
+        # 1. Check if at designated stand position (always valid if provided and matched)
+        if expected_stand_pos and current_pos == expected_stand_pos:
+            # If it's a workbench action, double-check WB is actually nearby from stand pos
+            if action_type in ['Craft', 'Invent'] and self.action_target and self.action_target.get('requires_workbench'):
+                 if not self._is_at_workbench():
+                      if cfg.DEBUG_AGENT_ACTIONS: print(f"Agent {self.id}: At stand pos, but no WB nearby for {self.current_action}.")
+                      return False
+            return True # At the specific planned standing spot
+
+        # 2. Check proximity/adjacency based on action type and goal
+        if not goal_pos: # If no goal, cannot verify proximity (unless action doesn't need it)
+             # Actions that DON'T need a goal/stand check (happen locally)
+             if action_type in ["Rest", "Signal"] or \
+                (action_type == "Craft" and not (self.action_target and self.action_target.get('requires_workbench'))):
+                 return True
+             else: # Action needed a goal for verification, but none exists
+                  if cfg.DEBUG_AGENT_ACTIONS: print(f"Agent {self.id}: Position error - Action {action_type} needs goal verification, but no goal found. Target: {self.action_target}")
+                  return False
+
+        # Calculate Chebyshev distance (max coordinate difference)
+        chebyshev_dist = 0
+        if goal_pos:
+            chebyshev_dist = max(abs(self.x - goal_pos[0]), abs(self.y - goal_pos[1]))
+
+        # --- Action-Specific Checks ---
+
+        # A. Actions requiring strict adjacency (Chebyshev dist = 1) to goal
+        strict_adjacency_actions = ['GatherWood', 'GatherStone', 'SatisfyThirst', 'SatisfyHunger']
+        is_strict_action = action_type in strict_adjacency_actions
+
+        # Check if the goal itself is non-walkable (requires standing adjacent)
+        goal_is_non_walkable = False
+        if goal_pos and 0 <= goal_pos[0] < self.world.width and 0 <= goal_pos[1] < self.world.height:
+            resource_at_goal = self.world.get_resource(goal_pos[0], goal_pos[1])
+            is_water_goal = self.world.get_terrain(goal_pos[0], goal_pos[1]) == cfg.TERRAIN_WATER
+            if (resource_at_goal and resource_at_goal.blocks_walk) or is_water_goal:
+                goal_is_non_walkable = True
+        # Also treat food as requiring adjacency if it's not walkable itself (config says it isn't, but check just in case)
+        elif action_type == 'SatisfyHunger' and goal_pos and \
+             (0 <= goal_pos[0] < self.world.width and 0 <= goal_pos[1] < self.world.height) and \
+             self.world.walkability_matrix[goal_pos[1], goal_pos[0]] == 0:
+             goal_is_non_walkable = True
+
+
+        if is_strict_action and goal_is_non_walkable:
+            if chebyshev_dist == 1:
+                return True # Standing exactly adjacent
+            else:
+                if cfg.DEBUG_AGENT_ACTIONS: print(f"Agent {self.id}: Position error - Action {action_type} requires strict adjacency (dist=1) to non-walkable goal {goal_pos}. Current dist={chebyshev_dist}. Current: {current_pos}")
+                return False
+
+        # B. Actions requiring proximity based on radius (Workbench, Help, Teach)
+        proximity_actions = {}
+        # Define the key for workbench craft actions consistently
+        wb_craft_key = 'CraftWB' # Define a key for workbench crafting
+        if action_type == 'Craft' and self.action_target and self.action_target.get('requires_workbench'):
+             proximity_actions[wb_craft_key] = cfg.WORKBENCH_INTERACTION_RADIUS
+        elif action_type == 'Invent':
+             proximity_actions['Invent'] = cfg.WORKBENCH_INTERACTION_RADIUS
+        elif action_type == 'Help':
+             proximity_actions['Help'] = cfg.HELPING_INTERACTION_RADIUS
+        elif action_type == 'Teach':
+             proximity_actions['Teach'] = cfg.TEACHING_INTERACTION_RADIUS
+
+        # Check proximity based actions using the defined keys
+        action_key_to_check = wb_craft_key if action_type == 'Craft' and self.action_target and self.action_target.get('requires_workbench') else action_type
+        if action_key_to_check in proximity_actions:
+            required_radius = proximity_actions[action_key_to_check]
+            if chebyshev_dist <= required_radius:
+                 # If workbench action, also verify a WB is actually nearby
+                 if action_key_to_check in [wb_craft_key, 'Invent']:
+                     if not self._is_at_workbench():
+                          if cfg.DEBUG_AGENT_ACTIONS: print(f"Agent {self.id}: Position OK relative to goal, but no WB nearby for {self.current_action}.")
+                          return False
+                 return True # Within required radius
+            else:
+                 if cfg.DEBUG_AGENT_ACTIONS: print(f"Agent {self.id}: Position error - Action {action_key_to_check} requires proximity radius {required_radius} to goal {goal_pos}. Current dist={chebyshev_dist}. Current: {current_pos}")
+                 return False
+
+        # C. Special case: GoToWorkbench - need to be near *a* workbench, not necessarily the specific goal WB if multiple exist
+        if action_type == 'GoToWorkbench':
+            if self._is_at_workbench(): # Check using radius
+                 return True
+            else:
+                 if cfg.DEBUG_AGENT_ACTIONS: print(f"Agent {self.id}: Position error - Arrived for GoToWorkbench but not near any workbench. Current: {current_pos}, Goal was: {goal_pos}")
+                 return False
+
+        # D. Actions allowing standing ON the goal tile if it's walkable (e.g., SatisfyHunger for berries, non-blocking resources)
+        if is_strict_action and not goal_is_non_walkable:
+             # Allow standing ON or ADJACENT
+             if chebyshev_dist <= 1:
+                 return True
+             else:
+                 if cfg.DEBUG_AGENT_ACTIONS: print(f"Agent {self.id}: Position error - Action {action_type} requires standing on or adjacent (dist<=1) to walkable goal {goal_pos}. Current dist={chebyshev_dist}. Current: {current_pos}")
+                 return False
+
+        # E. Fallback for actions not covered above (Wander arrival, potentially others)
+        if cfg.DEBUG_AGENT_ACTIONS: print(f"Agent {self.id}: Position verification reached fallback for action {action_type}. Assuming OK if no specific check failed. Current: {current_pos}, Goal: {goal_pos}, Stand: {expected_stand_pos}")
+        return True # Default assumption if no specific check failed.
+
+
+    # --- Methods below this line are unchanged from previous refinement ---
+
+    def _complete_action(self):
+        self.current_action = None; self.action_target = None
+        self.current_path = []; self.action_timer = 0.0
+
+    def _handle_death(self):
+        if cfg.DEBUG_AGENT_CHOICE:
+            print(f"Agent {self.id} has died at ({self.x}, {self.y}). Needs(Hl,H,T,E): ({self.health:.0f},{self.hunger:.0f},{self.thirst:.0f},{self.energy:.0f})")
+
+    def learn_skill(self, skill_name, boost=1.0):
+        if not skill_name: return False
+        if skill_name not in self.skills: self.skills[skill_name] = 0.0
+        current_level = self.skills[skill_name]
+        if current_level >= cfg.MAX_SKILL_LEVEL: return False
+        gain_factor = max(0.05, (1.0 - (current_level / (cfg.MAX_SKILL_LEVEL + 1)))**1.2)
+        increase = cfg.SKILL_INCREASE_RATE * boost * gain_factor
+        increase = max(0.01 * boost, increase)
+        new_level = min(cfg.MAX_SKILL_LEVEL, current_level + increase)
+        if new_level > current_level + 0.001:
+            self.skills[skill_name] = new_level
+            return True
+        return False
+
+    def _get_skill_multiplier(self, skill_name):
+        if not skill_name or skill_name not in self.skills: return 1.0
+        level = self.skills.get(skill_name, 0)
+        max_bonus = 1.5; exponent = 0.7
+        multiplier = 1.0 + max_bonus * (level / cfg.MAX_SKILL_LEVEL)**exponent
+        return max(0.1, multiplier)
+
+    def _has_ingredients(self, ingredients):
+        if not ingredients: return True
+        return all(self.inventory.get(item, 0) >= req for item, req in ingredients.items())
+
+    def _has_skill_for(self, recipe_details):
+        skill = recipe_details.get('skill')
+        min_level = recipe_details.get('min_level', 0)
+        return not skill or self.skills.get(skill, 0) >= min_level
+
+    def _check_passive_learning(self, agents):
+        for other in agents:
+             if other.id == self.id or other.health <= 0: continue
+             dist_sq = (self.x - other.x)**2 + (self.y - other.y)**2
+             if dist_sq <= cfg.PASSIVE_LEARN_RADIUS_SQ:
+                 action = other.current_action
+                 skill_to_learn = None
+                 if action:
+                      action_type = action.split(':')[0]
+                      if action_type == 'GatherWood': skill_to_learn = 'GatherWood'
+                      elif action_type == 'GatherStone': skill_to_learn = 'GatherStone'
+                      elif action_type == 'Craft':
+                           recipe_name = other.action_target.get('recipe') if other.action_target else None
+                           if recipe_name and recipe_name in cfg.RECIPES:
+                                skill_to_learn = cfg.RECIPES[recipe_name].get('skill')
+                 if skill_to_learn and self.skills.get(skill_to_learn, 0) < cfg.MAX_SKILL_LEVEL:
+                     rel_factor = max(0.5, 1.0 + self.knowledge.get_relationship(other.id) * 0.5)
+                     if random.random() < cfg.PASSIVE_LEARN_CHANCE * rel_factor:
+                         learned = self.learn_skill(skill_to_learn, boost=cfg.PASSIVE_LEARN_BOOST)
+                         if learned and cfg.DEBUG_SOCIAL:
+                              print(f"Agent {self.id} passively learned {skill_to_learn} -> {self.skills[skill_to_learn]:.2f} from observing Agent {other.id}")
+
+    def _find_best_resource_location(self, resource_type, max_search_dist=cfg.AGENT_VIEW_RADIUS):
+        best_pos, best_stand_pos, min_dist_sq = None, None, float('inf')
+        display_name = cfg.RESOURCE_INFO.get(resource_type, {}).get('name','?')
+        if resource_type == cfg.RESOURCE_WATER: display_name = "Water"
+        known_locations = self.knowledge.get_known_locations(resource_type)
+        locations_to_remove = []
+        for rx, ry in known_locations:
+            is_valid = False
+            if resource_type == cfg.RESOURCE_WATER:
+                 if self.world.get_terrain(rx, ry) == cfg.TERRAIN_WATER: is_valid = True
+            else:
+                 res = self.world.get_resource(rx, ry)
+                 if res and res.type == resource_type and not res.is_depleted(): is_valid = True
+            if is_valid:
+                stand_pos = self._find_stand_pos_for_resource(rx, ry)
+                if stand_pos:
+                    dist_sq = (self.x - stand_pos[0])**2 + (self.y - stand_pos[1])**2
+                    if dist_sq < min_dist_sq:
+                        min_dist_sq = dist_sq; best_pos = (rx, ry); best_stand_pos = stand_pos
+            else: locations_to_remove.append((rx, ry))
+        for rx, ry in locations_to_remove: self.knowledge.remove_resource_location(resource_type, rx, ry)
+        search_threshold_sq = (max_search_dist * 0.7)**2
+        if (not best_stand_pos or min_dist_sq > search_threshold_sq):
+            g_pos, s_pos, bfs_dist = self.world.find_nearest_resource(self.x, self.y, resource_type, max_dist=max_search_dist)
+            if s_pos:
+                 if resource_type != cfg.RESOURCE_WATER: self.knowledge.add_resource_location(resource_type, g_pos[0], g_pos[1])
+                 dist_sq_bfs = (self.x - s_pos[0])**2 + (self.y - s_pos[1])**2
+                 if dist_sq_bfs < min_dist_sq:
+                      min_dist_sq = dist_sq_bfs; best_pos = g_pos; best_stand_pos = s_pos
+        final_dist = math.sqrt(min_dist_sq) if best_stand_pos else float('inf')
+        return best_pos, best_stand_pos, final_dist
+
+    def _find_stand_pos_for_resource(self, res_x, res_y):
+        if self.world.get_terrain(res_x, res_y) == cfg.TERRAIN_WATER:
+             return self._find_adjacent_walkable(res_x, res_y, self.world.walkability_matrix)
+        resource = self.world.get_resource(res_x, res_y)
+        if not resource: return None
+        if self.world.walkability_matrix[res_y, res_x] == 1: return (res_x, res_y)
+        else: return self._find_adjacent_walkable(res_x, res_y, self.world.walkability_matrix)
+
+    def _find_stand_pos_for_agent(self, target_x, target_y, agents):
+         other_agent_positions = [(a.x, a.y) for a in agents if a != self and a.health > 0 and (a.x, a.y) != (target_x, target_y)]
+         temp_walkability = self.world.update_walkability(agent_positions=other_agent_positions)
+         return self._find_adjacent_walkable(target_x, target_y, temp_walkability)
+
+    def _is_at_workbench(self):
+        return self._is_near_resource_type(cfg.RESOURCE_WORKBENCH, cfg.WORKBENCH_INTERACTION_RADIUS)
+
+    def _get_nearby_workbench_pos(self):
+        return self._find_nearest_resource_pos_in_radius(cfg.RESOURCE_WORKBENCH, cfg.WORKBENCH_INTERACTION_RADIUS)
+
+    def _is_near_resource_type(self, res_type, radius):
+         for y in range(max(0, self.y-radius), min(self.world.height, self.y+radius+1)):
+              for x in range(max(0, self.x-radius), min(self.world.width, self.x+radius+1)):
+                  res = self.world.get_resource(x, y)
+                  if res and res.type == res_type: return True
+         return False
+
+    def _find_nearest_resource_pos_in_radius(self, res_type, radius):
+         min_dist_sq = float('inf'); found_pos = None
+         for r in range(radius + 1):
+              for dy in range(-r, r + 1):
+                   for dx in range(-r, r + 1):
+                        if max(abs(dx), abs(dy)) != r: continue
+                        x, y = self.x + dx, self.y + dy
+                        if 0 <= x < self.world.width and 0 <= y < self.world.height:
+                             res = self.world.get_resource(x, y)
+                             if res and res.type == res_type:
+                                  dist_sq = dx*dx + dy*dy
+                                  if dist_sq < min_dist_sq:
+                                       min_dist_sq = dist_sq; found_pos = (x, y)
+              if found_pos: return found_pos
+         return None
+
+    def _has_workbench_knowledge(self):
+         return len(self.knowledge.get_known_locations(cfg.RESOURCE_WORKBENCH)) > 0
+
+    def _plan_path(self, target_pos, agents):
+        start_pos = (self.x, self.y)
+        if not target_pos or start_pos == target_pos: return []
+        tx, ty = target_pos
+        if not (0 <= tx < self.world.width and 0 <= ty < self.world.height): return None
+        other_agent_positions = [(a.x, a.y) for a in agents if a != self and a.health > 0]
+        temp_walkability = self.world.update_walkability(agent_positions=other_agent_positions)
+        final_start = start_pos
+        if temp_walkability[start_pos[1], start_pos[0]] == 0:
+            adj_start = self._find_adjacent_walkable(start_pos[0], start_pos[1], temp_walkability)
+            if adj_start: final_start = adj_start
+            else: 
+                if cfg.DEBUG_PATHFINDING: print(f"Agent {self.id}: Start {start_pos} blocked, no adjacent walkable. Path fail."); return None
+        final_target = target_pos
+        if temp_walkability[ty, tx] == 0:
+            adj_target = self._find_adjacent_walkable(tx, ty, temp_walkability)
+            if adj_target: final_target = adj_target
+            else: 
+                if cfg.DEBUG_PATHFINDING: print(f"Agent {self.id}: Target {target_pos} blocked, no adjacent walkable. Path fail."); return None
+        path_nodes = find_path(temp_walkability, final_start, final_target)
+        if path_nodes is None: return None
+        else:
+            path_coords = [(node.x, node.y) for node in path_nodes]
+            if final_start != start_pos and path_coords: path_coords.insert(0, start_pos)
+            if cfg.DEBUG_PATHFINDING and path_coords: print(f"Agent {self.id}: Path found from {start_pos}(adj:{final_start}) to {target_pos}(adj:{final_target}) len {len(path_coords)}")
+            return path_coords
+
+    def _find_adjacent_walkable(self, x, y, walkability_matrix):
+        neighbors = [(0,-1), (0,1), (1,0), (-1,0), (1,-1), (1,1), (-1,1), (-1,-1)]
+        random.shuffle(neighbors)
+        for dx, dy in neighbors:
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < self.world.width and 0 <= ny < self.world.height and walkability_matrix[ny, nx] == 1:
+                return (nx, ny)
+        return None
+
+    def perceive_signal(self, signal: Signal):
+         self.pending_signal = signal
+         if cfg.DEBUG_SOCIAL: print(f"Agent {self.id} perceived signal '{signal.type}' from {signal.sender_id} at {signal.position}")
+
+    def _process_signals(self, agents, social_manager):
+         if not self.pending_signal: return
+         signal = self.pending_signal; sender_id = signal.sender_id; signal_type = signal.type; signal_pos = signal.position
+         self.pending_signal = None
+         if self.reacted_to_signal_type == signal_type: return
+         self.reacted_to_signal_type = signal_type
+         if cfg.DEBUG_SOCIAL: print(f"Agent {self.id} processing signal '{signal_type}' from {sender_id}")
+         sender_agent = self.world.get_agent_by_id(sender_id)
+         if not sender_agent: return
+         rel = self.knowledge.get_relationship(sender_id)
+         if signal_type == cfg.SIGNAL_HELP_NEEDED_FOOD:
+             if self.sociability > 0.4 and rel > cfg.HELPING_MIN_RELATIONSHIP and \
+                self.hunger < cfg.MAX_HUNGER * cfg.HELPING_SELF_NEED_THRESHOLD: # Use updated threshold
+                 item_to_give = next((item for item in cfg.HELPABLE_ITEMS if self.inventory.get(item, 0) > 0), None)
+                 if item_to_give:
+                     if cfg.DEBUG_SOCIAL: print(f"Agent {self.id} deciding to help Agent {sender_id} with {item_to_give} due to signal.")
+                     self._interrupt_and_set_action(f"Help:{sender_id}:{item_to_give}", agents)
+                     return
+         elif signal_type == cfg.SIGNAL_FOUND_FOOD:
+              if self.hunger > cfg.MAX_HUNGER * 0.5 and rel >= -0.1:
+                   is_known_food = any(loc == signal_pos for loc in self.knowledge.get_known_locations(cfg.RESOURCE_FOOD))
+                   if not is_known_food:
+                        if cfg.DEBUG_SOCIAL: print(f"Agent {self.id} investigating potential food at {signal_pos} due to signal from {sender_id}.")
+                        stand_pos = self._find_adjacent_walkable(signal_pos[0], signal_pos[1], self.world.walkability_matrix)
+                        if stand_pos:
+                             target_data = {'type': 'MoveToSignal', 'goal': signal_pos, 'stand': stand_pos}
+                             self._interrupt_and_set_action(f"MoveToSignal:{signal_pos[0]}:{signal_pos[1]}", agents, target_data)
+                             return
+         elif signal_type == cfg.SIGNAL_DANGER_NEAR:
+              if cfg.DEBUG_SOCIAL: print(f"Agent {self.id} attempting to flee from danger signal at {signal_pos} from {sender_id}.")
+              for _ in range(5):
+                   dx = random.randint(-cfg.WANDER_RADIUS, cfg.WANDER_RADIUS); dy = random.randint(-cfg.WANDER_RADIUS, cfg.WANDER_RADIUS)
+                   away_x = self.x - signal_pos[0]; away_y = self.y - signal_pos[1]
+                   norm = math.sqrt(away_x**2 + away_y**2)
+                   if norm > 0: dx += int(away_x / norm * 2); dy += int(away_y / norm * 2)
+                   wx = max(0, min(self.world.width - 1, self.x + dx)); wy = max(0, min(self.world.height - 1, self.y + dy))
+                   if self.world.walkability_matrix[wy, wx] == 1 and self.world.terrain_map[wy,wx] == cfg.TERRAIN_GROUND:
+                       target_data = {'type': 'Wander', 'goal': (wx, wy), 'stand': (wx, wy)}
+                       self._interrupt_and_set_action("Wander", agents, target_data)
+                       return
+              self._interrupt_and_set_action("Wander", agents) # Fallback wander
+         self.reacted_to_signal_type = None
+
+    def _interrupt_and_set_action(self, action_name, agents, action_target_data=None):
+         if cfg.DEBUG_AGENT_ACTIONS: print(f"Agent {self.id} interrupting '{self.current_action}' for '{action_name}'")
+         self._complete_action()
+         self.current_action = action_name
+         if not action_target_data:
+              feasible, target_data = self._check_action_feasibility(action_name, agents)
+              if feasible: self.action_target = target_data
+              else:
+                   print(f"Agent {self.id}: Failed feasibility check for interruption action {action_name}. Reverting to Idle.")
+                   self.current_action = "Idle"; self.action_target = None; return
+         else: self.action_target = action_target_data
+         self._plan_path_for_action(agents)
+
+    def _find_nearby_agents(self, agents, radius):
+         nearby = []
+         min_x=self.x-radius; max_x=self.x+radius; min_y=self.y-radius; max_y=self.y+radius
+         for other in agents:
+              # Ensure we are checking against the current list of *living* agents
+              if other.id != self.id and other.health > 0 and min_x <= other.x <= max_x and min_y <= other.y <= max_y:
+                  nearby.append(other)
+         return nearby
+
+# Contents of config.py
+# Contents of config.py
+# config.py
+import pygame
+
+# Screen/Display Settings
+SCREEN_WIDTH = 1000
+SCREEN_HEIGHT = 750
+SIDE_PANEL_WIDTH = 250 # For UI Info
+GAME_WIDTH = SCREEN_WIDTH - SIDE_PANEL_WIDTH
+CELL_SIZE = 20
+GRID_WIDTH = GAME_WIDTH // CELL_SIZE
+GRID_HEIGHT = SCREEN_HEIGHT // CELL_SIZE
+FPS = 15 # Simulation steps per second
+
+# --- Debug Flags ---
+DEBUG_PATHFINDING = False # Print pathfinding details
+DEBUG_AGENT_AI = False    # Print agent utility scores
+DEBUG_AGENT_CHOICE = True   # Print chosen action and basic info
+DEBUG_AGENT_ACTIONS = True  # Print action execution steps (Gather, Craft, Eat, etc.)
+DEBUG_SOCIAL = True       # Print social interactions (signals, learning, helping)
+DEBUG_KNOWLEDGE = False   # Print knowledge updates (recipes, locations) - Less verbose now
+DEBUG_WORLD_GEN = False   # Print detailed world gen steps (can be verbose)
+DEBUG_INVENTION = False   # Print invention attempt details
+
+# Colors
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+GREEN = (0, 150, 0)   # Ground
+BLUE = (0, 0, 200)    # Water
+GRAY = (128, 128, 128) # Stone Resource Color (distinct from Dark Gray terrain)
+DARK_GRAY = (80, 80, 80) # Obstacle Terrain
+BROWN = (139, 69, 19)  # Tree / Wood
+RED = (200, 0, 0)     # Agent color
+YELLOW = (255, 255, 0) # Food (Berries)
+ORANGE = (255, 165, 0) # Workbench Color
+PURPLE = (128, 0, 128) # Signal visualization color
+UI_BG_COLOR = (50, 50, 50)
+UI_TEXT_COLOR = (200, 200, 200)
+
+# Time System
+SIMULATION_SPEED_FACTOR = 50 # How many simulation seconds pass per real second
+DAY_LENGTH_SECONDS = 60 * 10 # Duration of a full day-night cycle in simulation seconds
+
+# World Generation
+NUM_WATER_PATCHES = 5
+WATER_PATCH_SIZE = (3, 8)
+NUM_FOOD_SOURCES = 35 # Increased slightly
+NUM_TREES = 25
+NUM_ROCKS = 15
+NUM_INITIAL_WORKBENCHES = 1 # Start with one workbench for testing Phase 3+
+RESOURCE_REGEN_RATE = 0.005 # Chance per sim second resource quantity increases
+
+# Agent Defaults
+INITIAL_AGENT_COUNT = 5 # Keep small for observation
+MAX_HEALTH = 100
+MAX_ENERGY = 100
+MAX_HUNGER = 100 # Higher value means MORE hungry (0 = full)
+MAX_THIRST = 100 # Higher value means MORE thirsty (0 = full)
+INVENTORY_CAPACITY = 20
+BASE_INTELLIGENCE = 0.5 # Affects invention speed
+
+# Needs Decay Rates (per simulation second)
+HEALTH_REGEN_RATE = 0.15 # Slightly increased regen when resting
+ENERGY_DECAY_RATE = 0.18 # Slightly lower base decay
+ENERGY_REGEN_RATE = 1.5  # While resting
+HUNGER_INCREASE_RATE = 0.40 # <<< SIGNIFICANTLY DECREASED from 0.50
+THIRST_INCREASE_RATE = 0.55 # <<< SIGNIFICANTLY DECREASED from 0.65
+
+# Action Costs / Effects (Durations in sim seconds, Costs per action/tick)
+MOVE_ENERGY_COST = 0.07    # Slightly lower move cost
+EAT_HUNGER_REDUCTION = 60  # <<< INCREASED from 50
+DRINK_THIRST_REDUCTION = 70  # <<< INCREASED from 60
+GATHER_BASE_DURATION = 2.0 # Base time to gather 1 unit
+GATHER_ENERGY_COST = 0.5   # Slightly lower gather cost
+CRAFT_BASE_DURATION = 4.0  # Base time to craft an item
+CRAFT_ENERGY_COST = 1.0    # Slightly lower craft cost
+INVENT_BASE_DURATION = 8.0 # Base time for an invention attempt cycle
+INVENT_ENERGY_COST = 1.8   # Slightly lower invent cost
+# --- Phase 4: Social Costs ---
+SIGNAL_ENERGY_COST = 0.1
+TEACH_BASE_DURATION = 15.0
+TEACH_ENERGY_COST = 1.2 # Slightly lower teach cost
+LEARN_BASE_DURATION = 15.0
+LEARN_ENERGY_COST = 0.8 # Slightly lower learn cost
+HELP_BASE_DURATION = 1.0
+HELP_ENERGY_COST = 0.2 # Slightly lower help cost
+
+# AI Settings
+WANDER_RADIUS = 6        # Max distance for random wander target
+UTILITY_THRESHOLD = 0.15 # Minimum utility score to consider an action (except Wander)
+AGENT_VIEW_RADIUS = 25   # How far agents can "see" for finding resources (BFS limit)
+WORKBENCH_INTERACTION_RADIUS = 1 # Chebyshev distance (0=on tile, 1=adjacent) to use workbench
+INVENTION_ITEM_TYPES_THRESHOLD = 3 # Min different item types in inventory to attempt invention
+# --- AI Utility Weights ---
+UTILITY_THIRST_WEIGHT = 1.25 # <<< Further slight increase
+UTILITY_HUNGER_WEIGHT = 1.20 # <<< Increased
+
+
+# Skill Settings
+INITIAL_SKILL_LEVEL = 0
+MAX_SKILL_LEVEL = 100
+SKILL_INCREASE_RATE = 0.8 # Base increase per successful action (adjusted by diminishing returns)
+TEACHING_BOOST_FACTOR = 5.0 # Multiplier for skill gain when taught
+PASSIVE_LEARN_BOOST = 0.05 # Small boost multiplier for passive learning
+TEACHING_MIN_SKILL_ADVANTAGE = 8.0 # Keep lowered value
+
+
+# Tool Settings (Multipliers for speed/efficiency)
+TOOL_EFFICIENCY = {
+    'CrudeAxe': 1.8,
+    'StonePick': 1.8,
+}
+
+# Crafting Recipes
+RECIPES = {
+    'Workbench': {
+        'ingredients': {'Wood': 5, 'Stone': 2},
+        'skill': 'BasicCrafting',
+        'min_level': 3,
+        'workbench': False
+    },
+    'CrudeAxe': {
+        'ingredients': {'Wood': 2, 'Stone': 1},
+        'skill': 'BasicCrafting',
+        'min_level': 1,
+        'workbench': False
+    },
+    'StonePick': {
+        'ingredients': {'Wood': 2, 'Stone': 3},
+        'skill': 'BasicCrafting',
+        'min_level': 5,
+        'workbench': True
+     },
+     'SmallShelter': {
+         'ingredients': {'Wood': 8},
+         'skill': 'BasicCrafting',
+         'min_level': 8,
+         'workbench': True
+     },
+     'CookedFood': {
+         'ingredients': {'Food': 1},
+         'skill': 'BasicCrafting',
+         'min_level': 2,
+         'workbench': True,
+     },
+}
+
+# Terrain/Resource Codes
+TERRAIN_GROUND = 0
+TERRAIN_WATER = 1
+TERRAIN_OBSTACLE = 2
+
+RESOURCE_NONE = 0
+RESOURCE_FOOD = 1
+RESOURCE_WATER = 2
+RESOURCE_WOOD = 3
+RESOURCE_STONE = 4
+RESOURCE_WORKBENCH = 5
+
+# Map terrain to colors
+TERRAIN_COLORS = {
+    TERRAIN_GROUND: GREEN,
+    TERRAIN_WATER: BLUE,
+    TERRAIN_OBSTACLE: DARK_GRAY,
+}
+
+# Map resource type to display info
+RESOURCE_INFO = {
+    RESOURCE_FOOD: {'color': YELLOW, 'name': 'Food', 'block_walk': False, 'max_quantity': 6, 'regen': 0.01}, # Slightly more quantity
+    RESOURCE_WOOD: {'color': BROWN, 'name': 'Wood', 'block_walk': True, 'max_quantity': 8, 'regen': 0.002},
+    RESOURCE_STONE: {'color': GRAY, 'name': 'Stone', 'block_walk': True, 'max_quantity': 10, 'regen': 0.001},
+    RESOURCE_WORKBENCH: {'color': ORANGE, 'name': 'Workbench', 'block_walk': False, 'max_quantity': 1, 'regen': 0},
+}
+
+# Pathfinding Settings
+MAX_PATHFINDING_ITERATIONS = 3500
+
+# --- Phase 4: Social Settings ---
+SIGNAL_RANGE_SQ = 18**2
+SIGNAL_DURATION_TICKS = 5
+RELATIONSHIP_DECAY_RATE = 0.001
+HELPING_MIN_RELATIONSHIP = -0.1 # Keep lowered
+HELPING_TARGET_NEED_THRESHOLD = 0.8
+HELPING_SELF_NEED_THRESHOLD = 0.7 # <<< RELAXED from 0.6
+HELPING_INTERACTION_RADIUS = 2
+TEACHING_MIN_RELATIONSHIP = 0.0 # Keep lowered
+TEACHING_INTERACTION_RADIUS = 2
+PASSIVE_LEARN_RADIUS_SQ = 5**2
+PASSIVE_LEARN_CHANCE = 0.05
+RELATIONSHIP_CHANGE_HELP = 0.20
+RELATIONSHIP_CHANGE_TEACH = 0.15
+RELATIONSHIP_CHANGE_SIGNAL_RESPONSE = 0.05
+
+# Signal Types
+SIGNAL_HELP_NEEDED_FOOD = "HelpFood"
+SIGNAL_HELP_NEEDED_HEALTH = "HelpHealth"
+SIGNAL_FOUND_FOOD = "FoundFood"
+SIGNAL_FOUND_WATER = "FoundWater"
+SIGNAL_DANGER_NEAR = "Danger"
+
+# Items that can be 'given' during Help action
+HELPABLE_ITEMS = {'Food', 'CookedFood'}
+
+# Contents of knowledge.py
+# Contents of knowledge.py
+# knowledge.py
+import random
+import config as cfg
+import traceback # For debugging invention
+
+class KnowledgeSystem:
+    """
+    Manages an agent's knowledge about the world, including resource locations,
+    crafting recipes, and social relationships. Phase 4: Includes relationships.
+    """
+    def __init__(self, agent_id):
+        """ Initializes the knowledge base for a specific agent. """
+        self.agent_id = agent_id
+
+        # Known locations: type -> set of (x,y) tuples for quick lookup
+        self.known_resource_locations = {
+            cfg.RESOURCE_FOOD: set(),
+            cfg.RESOURCE_WATER: set(), # Stores specific water tiles interacted with
+            cfg.RESOURCE_WOOD: set(),
+            cfg.RESOURCE_STONE: set(),
+            cfg.RESOURCE_WORKBENCH: set(), # Stores locations of known workbenches
+        }
+
+        # Known crafting recipes: set of recipe names (e.g., 'CrudeAxe')
+        self.known_recipes = set()
+
+        # --- Phase 4: Social Knowledge ---
+        # other_agent_id -> relationship_score (-1.0 to 1.0)
+        self.relationships = {}
+
+    def add_resource_location(self, resource_type, x, y):
+        """ Adds a resource location to the agent's memory. """
+        if resource_type in self.known_resource_locations:
+             if (x, y) not in self.known_resource_locations[resource_type]:
+                 self.known_resource_locations[resource_type].add((x, y))
+                 # Optional: Add debug log (kept false by default in config now)
+                 # if cfg.DEBUG_KNOWLEDGE: ...
+
+    def remove_resource_location(self, resource_type, x, y):
+         """ Removes a resource location (e.g., if found depleted or destroyed). """
+         if resource_type in self.known_resource_locations:
+              if (x,y) in self.known_resource_locations[resource_type]:
+                   self.known_resource_locations[resource_type].discard((x, y))
+                   # Optional: Add debug log
+                   # if cfg.DEBUG_KNOWLEDGE: ...
+
+    def get_known_locations(self, resource_type):
+        """ Returns a list of known (x, y) locations for a given resource type. """
+        return list(self.known_resource_locations.get(resource_type, set()))
+
+    def add_recipe(self, recipe_name):
+        """ Adds a learned recipe to the agent's knowledge. Returns True if newly learned."""
+        if recipe_name in cfg.RECIPES and recipe_name not in self.known_recipes:
+            self.known_recipes.add(recipe_name)
+            if cfg.DEBUG_KNOWLEDGE: print(f"Agent {self.agent_id} learned recipe: {recipe_name}")
+            return True
+        return False
+
+    def knows_recipe(self, recipe_name):
+        """ Checks if the agent knows a specific recipe. """
+        return recipe_name in self.known_recipes
+
+    # --- Phase 3: Invention ---
+    def attempt_invention(self, inventory, skills):
+        """
+        Simulates an invention attempt by combining items from inventory.
+        Currently uses a simple random combination check against unknown recipes.
+        Requires being at a workbench (location check handled by Agent).
+        Returns discovered recipe name or None.
+        """
+        if not inventory or len(inventory) < cfg.INVENTION_ITEM_TYPES_THRESHOLD: return None
+        if cfg.DEBUG_INVENTION: print(f"Agent {self.agent_id} attempting invention with inventory: {inventory}")
+
+        available_items = list(inventory.keys())
+        discovered_recipe = None
+        invention_attempts = 3
+
+        for _ in range(invention_attempts):
+            num_items_to_combine = random.randint(2, min(3, len(available_items)))
+            items_to_try = set(random.sample(available_items, num_items_to_combine))
+            if cfg.DEBUG_INVENTION: print(f"  Trying combination: {items_to_try}")
+
+            for recipe_name, details in cfg.RECIPES.items():
+                if self.knows_recipe(recipe_name): continue
+                try:
+                    ingredients = details.get('ingredients', {})
+                    if not ingredients: continue
+                    ingredient_items = set(ingredients.keys())
+                    if items_to_try != ingredient_items: continue
+
+                    has_enough = all(inventory.get(item, 0) >= count for item, count in ingredients.items())
+                    if not has_enough: continue
+
+                    skill_req = details.get('skill'); min_level = details.get('min_level', 0)
+                    if skill_req and skills.get(skill_req, 0) < min_level:
+                         if cfg.DEBUG_INVENTION: print(f"    -> Potential {recipe_name}, but skill '{skill_req}' too low ({skills.get(skill_req, 0):.1f} < {min_level})")
+                         continue
+
+                    if self.add_recipe(recipe_name):
+                        if cfg.DEBUG_INVENTION: print(f"  >>> Agent {self.agent_id} DISCOVERED recipe: {recipe_name}!")
+                        discovered_recipe = recipe_name; break
+                except Exception as e:
+                     print(f"!!! Error checking recipe {recipe_name} during invention for agent {self.agent_id}: {e}"); traceback.print_exc(); continue
+            if discovered_recipe: break
+
+        if not discovered_recipe and cfg.DEBUG_INVENTION: print(f"  Agent {self.agent_id} failed to invent anything this time.")
+        return discovered_recipe
+
+    # --- Phase 4: Social Knowledge Methods ---
+    def update_relationship(self, other_agent_id, change):
+        """ Updates the relationship score with another agent, clamping between -1.0 and 1.0. """
+        if other_agent_id == self.agent_id: return # Cannot have relationship with self
+        current = self.relationships.get(other_agent_id, 0.0)
+        new_score = max(-1.0, min(1.0, current + change))
+        if abs(new_score - current) > 0.01: # Only update if change is significant
+             self.relationships[other_agent_id] = new_score
+             if cfg.DEBUG_SOCIAL: print(f"Agent {self.agent_id} relationship with Agent {other_agent_id}: {current:.2f} -> {new_score:.2f} (Change: {change:.2f})")
+
+    def get_relationship(self, other_agent_id):
+        """ Gets the relationship score with another agent (default 0). """
+        if other_agent_id == self.agent_id: return 0.0 # Relationship with self is neutral
+        return self.relationships.get(other_agent_id, 0.0)
+
+    def decay_relationships(self, dt_sim_seconds):
+        """ Slowly moves all relationships towards 0. """
+        decay_amount = cfg.RELATIONSHIP_DECAY_RATE * dt_sim_seconds
+        if decay_amount == 0: return # No decay if rate is zero or dt is zero
+
+        # Iterate over a copy of keys in case relationship is removed (e.g., goes exactly to 0)
+        for other_id in list(self.relationships.keys()):
+             current_score = self.relationships[other_id]
+             if current_score > 0:
+                 new_score = max(0.0, current_score - decay_amount)
+             elif current_score < 0:
+                 new_score = min(0.0, current_score + decay_amount)
+             else: # Already neutral
+                 continue
+
+             if abs(new_score) < 0.01: # Remove if very close to zero
+                  del self.relationships[other_id]
+                  # Optional debug log for removal due to decay
+                  # if cfg.DEBUG_SOCIAL: print(f"Agent {self.agent_id} relationship with {other_id} decayed to neutral.")
+             elif abs(new_score - current_score) > 0.001 : # Update only if changed noticeably
+                  self.relationships[other_id] = new_score
+                  # Optional debug log for decay step
+                  # if cfg.DEBUG_SOCIAL: print(f"Agent {self.agent_id} relationship with {other_id} decayed: {current_score:.2f} -> {new_score:.2f}")
+
+# Contents of main.py
+# main.py
+import pygame
+import sys
+import random
+import time # For performance tracking
+
+import config as cfg
+from world import World
+from agent import Agent
+from ui import draw_world, draw_agent, draw_ui # draw_world now needs social_manager
+from social import SocialManager # Phase 4
+
+def main():
+    """ Main function to initialize and run the simulation. """
+    pygame.init()
+    pygame.font.init()
+    screen = pygame.display.set_mode((cfg.SCREEN_WIDTH, cfg.SCREEN_HEIGHT))
+    pygame.display.set_caption("Project Genesis - Simulation (Phase 4)")
+    clock = pygame.time.Clock()
+
+    print("Initializing World...")
+    world = World(cfg.GRID_WIDTH, cfg.GRID_HEIGHT)
+    # Optional: Load world state (Remember agent state is not saved/loaded yet)
+    # world.load_state()
+
+    print("Initializing Agents...")
+    agents = []
+    for i in range(cfg.INITIAL_AGENT_COUNT):
+        placed = False
+        for attempt in range(cfg.GRID_WIDTH * cfg.GRID_HEIGHT * 2):
+            start_x = random.randint(0, world.width - 1)
+            start_y = random.randint(0, world.height - 1)
+            if world.walkability_matrix[start_y, start_x] == 1 and \
+               world.terrain_map[start_y, start_x] == cfg.TERRAIN_GROUND:
+                res_at_start = world.get_resource(start_x, start_y)
+                if not res_at_start or not getattr(res_at_start, 'blocks_walk', False):
+                    agent = Agent(start_x, start_y, world)
+                    agents.append(agent)
+                    if cfg.DEBUG_AGENT_CHOICE: print(f"  Agent {agent.id} created at ({start_x},{start_y}) Soc:{agent.sociability:.2f}")
+                    placed = True; break
+        if not placed: print(f"Error: Could not find valid starting position for agent {i+1}!")
+
+    print(f"Initialized {len(agents)} agents.")
+    world.agents_by_id = {a.id: a for a in agents}
+
+    print("Initializing Social Manager...")
+    social_manager = SocialManager(agents) # Pass initial agent list
+
+    selected_agent = None
+    running = True; paused = False
+    last_update_time = time.time(); update_times = []
+
+    print("Starting Simulation Loop...")
+    while running:
+        # --- Event Handling ---
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT: running = False
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE: running = False
+                if event.key == pygame.K_SPACE: paused = not paused; print("Paused" if paused else "Resumed")
+                if event.key == pygame.K_s and pygame.key.get_mods() & pygame.KMOD_CTRL:
+                     print("Saving world state (Agent state NOT saved)..."); world.save_state()
+                if event.key == pygame.K_l and pygame.key.get_mods() & pygame.KMOD_CTRL:
+                     print("Loading world state...")
+                     if world.load_state():
+                          print("World loaded. Clearing agents - Requires re-initialization or agent load logic.")
+                          agents = []; social_manager.update_agent_list(agents); selected_agent = None; world.agents_by_id = {}
+                          # Optionally re-spawn agents here
+                     else: print("World load failed.")
+
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                 mouse_x, mouse_y = event.pos
+                 if mouse_x < cfg.GAME_WIDTH:
+                     grid_x = mouse_x // cfg.CELL_SIZE; grid_y = mouse_y // cfg.CELL_SIZE
+                     clicked_on_tile = [a for a in agents if a.health > 0 and a.x == grid_x and a.y == grid_y]
+                     if clicked_on_tile:
+                         # Cycle selection if clicking same tile multiple times
+                         current_idx = -1
+                         if selected_agent and selected_agent in clicked_on_tile:
+                              try: current_idx = clicked_on_tile.index(selected_agent)
+                              except ValueError: current_idx = -1 # Should not happen
+                         next_idx = (current_idx + 1) % len(clicked_on_tile)
+                         new_selection = clicked_on_tile[next_idx]
+                     else: new_selection = None # Clicked empty space
+
+                     if selected_agent != new_selection:
+                         selected_agent = new_selection
+                         if cfg.DEBUG_AGENT_CHOICE: print(f"Selected Agent: {selected_agent.id if selected_agent else 'None'}")
+
+        # --- Simulation Update Step (if not paused) ---
+        if not paused:
+            current_time = time.time()
+            dt_real_seconds = min(current_time - last_update_time, 1.0 / (cfg.FPS * 0.5))
+            last_update_time = current_time
+            start_update_time = current_time
+            dt_sim_seconds = dt_real_seconds * cfg.SIMULATION_SPEED_FACTOR
+
+            # 1. Update World (Time, Resources)
+            world.update(dt_real_seconds, agents) # agents potentially used for context
+
+            # 2. Update Social Manager (Signal cleanup, Relationship decay)
+            social_manager.update(dt_sim_seconds) # Pass sim time for decay rate
+
+            # 3. Update Agents (Needs, Decisions, Actions, Passive Learning)
+            agents_to_remove = []
+            current_agents_list = list(agents) # Use a stable list for this tick's updates
+            for agent in current_agents_list:
+                if agent.health > 0:
+                    # Pass the current, stable list of agents for decision context
+                    agent.update(dt_real_seconds, current_agents_list, social_manager)
+                if agent.health <= 0 and agent not in agents_to_remove:
+                     agents_to_remove.append(agent)
+
+            # 4. Remove Dead Agents
+            if agents_to_remove:
+                if cfg.DEBUG_AGENT_CHOICE: print(f"Removing {len(agents_to_remove)} dead agents: {[a.id for a in agents_to_remove]}")
+                agents = [a for a in agents if a.health > 0] # Update main list
+                social_manager.update_agent_list(agents) # Update social manager's view
+                world.agents_by_id = {a.id: a for a in agents} # Update world's agent dict
+                if selected_agent in agents_to_remove: selected_agent = None
+
+            # Optional: Performance Monitoring
+            end_update_time = time.time()
+            update_times.append(end_update_time - start_update_time)
+            if len(update_times) > 100: update_times.pop(0)
+
+
+        # --- Drawing Step ---
+        screen.fill(cfg.BLACK)
+        draw_world(screen, world, social_manager) # Pass social_manager to draw signals
+
+        # Draw agents
+        for agent in agents: # Draw from the potentially updated list
+            if agent != selected_agent and agent.health > 0: draw_agent(screen, agent)
+        if selected_agent and selected_agent.health > 0: draw_agent(screen, selected_agent) # Draw selected last
+
+        draw_ui(screen, world, agents, selected_agent, social_manager, clock) # Pass social_manager for UI info? (Not used yet)
+        pygame.display.flip()
+        clock.tick(cfg.FPS)
+
+        # Optional: Periodic performance print
+        # if not paused and len(update_times) > 0 and int(world.simulation_time) % 60 == 0:
+        #      avg_update = sum(update_times) / len(update_times)
+        #      print(f"[Perf] Avg update time: {avg_update*1000:.2f} ms | Sim Time: {world.simulation_time:.0f}s")
+
+
+    # --- Cleanup ---
+    print("Exiting Simulation.")
+    pygame.quit()
+    sys.exit()
+
+if __name__ == '__main__':
+    main()
+
+# Contents of pathfinding_utils.py
+# pathfinding_utils.py
+import numpy as np
+from pathfinding.core.diagonal_movement import DiagonalMovement
+from pathfinding.core.grid import Grid
+from pathfinding.finder.a_star import AStarFinder
+import time # For debug timing
+import config as cfg # Import config for debug flags and limits
+import traceback # For error logging
+
+def find_path(world_grid_data, start_pos, end_pos):
+    """
+    Uses A* algorithm to find a path on the world grid.
+
+    Args:
+        world_grid_data (numpy.ndarray): 2D array representing walkability (1=walkable, 0=obstacle).
+        start_pos (tuple): (x, y) starting coordinates.
+        end_pos (tuple): (x, y) target coordinates.
+
+    Returns:
+        list: A list of pathfinding.core.node.GridNode objects representing the path,
+              excluding the start node. Returns empty list if start==end.
+              Returns None if no path found, start/end invalid, or internal error.
+    """
+    start_time = time.time()
+    try:
+        # Ensure integer coordinates
+        start_pos = (int(start_pos[0]), int(start_pos[1]))
+        end_pos = (int(end_pos[0]), int(end_pos[1]))
+
+        grid_height, grid_width = world_grid_data.shape
+
+        # Basic bounds check for start and end positions
+        if not (0 <= start_pos[0] < grid_width and 0 <= start_pos[1] < grid_height):
+            if cfg.DEBUG_PATHFINDING: print(f"Pathfinding Error: Start node {start_pos} out of bounds.")
+            return None # Invalid start
+        if not (0 <= end_pos[0] < grid_width and 0 <= end_pos[1] < grid_height):
+             if cfg.DEBUG_PATHFINDING: print(f"Pathfinding Error: End node {end_pos} out of bounds.")
+             return None # Invalid end
+
+        # Create grid object AFTER bounds check
+        # The pathfinding library expects matrix dimensions as (width, height)
+        # but numpy arrays are (height, width). Transpose is needed if library expects (w,h).
+        # Let's assume the library handles numpy arrays correctly (row=y, col=x)
+        grid = Grid(matrix=world_grid_data)
+        start_node = grid.node(start_pos[0], start_pos[1])
+        end_node = grid.node(end_pos[0], end_pos[1])
+
+        # Check walkability using the grid object's nodes
+        # The Agent logic should handle adjusting start/end if they are blocked,
+        # but we add checks here for robustness. find_path requires walkable start/end.
+        if not start_node.walkable:
+            if cfg.DEBUG_PATHFINDING: print(f"Pathfinding Error: Start node {start_pos} is not walkable in the provided grid.")
+            # Agent logic should have prevented this call or adjusted 'start_pos'
+            return None
+        if not end_node.walkable:
+             if cfg.DEBUG_PATHFINDING: print(f"Pathfinding Warning: End node {end_pos} is not walkable in the provided grid (Caller should have adjusted).")
+             # A* requires a walkable end node.
+             return None
+
+        # Configure A* finder: allow diagonal movement, default weight
+        finder = AStarFinder(diagonal_movement=DiagonalMovement.always, weight=1)
+
+        # Limit iterations to prevent runaway calculations on impossible paths
+        finder.max_iterations = cfg.MAX_PATHFINDING_ITERATIONS
+
+        # Find the path using the library
+        path, runs = finder.find_path(start_node, end_node, grid)
+
+        # Performance logging for slow paths
+        duration = time.time() - start_time
+        if cfg.DEBUG_PATHFINDING and duration > 0.01: # Log paths taking longer than 10ms
+             path_len = len(path) if path else 0
+             print(f"Pathfinding took {duration:.4f}s for {start_pos}->{end_pos} ({runs} runs). Path length: {path_len}")
+
+        # Return path excluding the start node if found, otherwise None for no path
+        if path:
+            return path[1:] # Exclude the starting node itself
+        else:
+             # No path found between the (potentially adjusted) start and end nodes
+             return None
+
+    except Exception as e:
+        # Catch potential errors from the pathfinding library or unexpected issues
+        print(f"!!! Pathfinding unexpected error for {start_pos} -> {end_pos}: {e}")
+        traceback.print_exc()
+        return None # Indicate error state
+
+def create_walkability_matrix(world_terrain_map, world_resource_map):
+    """
+    Creates a walkability matrix (1=walkable, 0=obstacle) based on terrain
+    and resources that block movement.
+    """
+    height, width = world_terrain_map.shape
+    # Start with ground tiles being walkable (1), others not (0)
+    walkability_matrix = (world_terrain_map == cfg.TERRAIN_GROUND).astype(np.uint8) # Use uint8 for efficiency
+
+    # Iterate through resources and mark tiles as non-walkable if resource blocks walk
+    for y in range(height):
+        for x in range(width):
+            # Only need to check if tile is currently marked walkable
+            if walkability_matrix[y, x] == 1:
+                resource = world_resource_map[y, x]
+                # Check if resource exists and its 'blocks_walk' attribute is True
+                if resource and getattr(resource, 'blocks_walk', False):
+                     walkability_matrix[y, x] = 0 # Mark as non-walkable
+
+    return walkability_matrix
+
+# Contents of social.py
+# social.py
+import config as cfg
+import random
+import time # For signal timestamping
+
+class Signal:
+    """ Represents a signal broadcast by an agent. """
+    def __init__(self, sender_id, signal_type, position, strength=1.0, timestamp=None):
+        self.sender_id = sender_id
+        self.type = signal_type
+        self.position = position # (x, y) where the signal originated
+        self.strength = strength # Potential future use (e.g., fades over distance)
+        self.timestamp = timestamp if timestamp is not None else time.time() # Real world timestamp for visualization decay
+
+class SocialManager:
+    """ Manages social interactions between agents (Phase 4). """
+    def __init__(self, agents):
+        """ Initializes the manager with the current list of agents. """
+        self.agents_dict = {agent.id: agent for agent in agents}
+        # List to keep track of active signals for visualization or broader processing
+        self.active_signals = []
+
+    def update_agent_list(self, agents):
+        """ Call this if the main agent list changes (e.g., agent death). """
+        self.agents_dict = {agent.id: agent for agent in agents if agent.health > 0}
+
+    def broadcast_signal(self, sending_agent, signal_type, position):
+        """ Creates a Signal object and notifies nearby agents. """
+        if sending_agent.id not in self.agents_dict:
+             if cfg.DEBUG_SOCIAL: print(f"Warning: Dead agent {sending_agent.id} tried to broadcast.")
+             return # Sender might have just died or is invalid
+
+        sender_pos = (sending_agent.x, sending_agent.y) # Use sender's current position
+        new_signal = Signal(sending_agent.id, signal_type, sender_pos)
+        self.active_signals.append(new_signal) # Add to active signals list
+
+        if cfg.DEBUG_SOCIAL: print(f"Agent {sending_agent.id} broadcasting '{signal_type}' from {sender_pos}")
+
+        recipients = []
+        for agent_id, agent in self.agents_dict.items():
+            # Don't signal self, ensure agent is alive
+            if agent.id != sending_agent.id and agent.health > 0:
+                # Use squared distance for efficiency
+                dist_sq = (agent.x - sender_pos[0])**2 + (agent.y - sender_pos[1])**2
+                if dist_sq < cfg.SIGNAL_RANGE_SQ:
+                    # Agent perceives the signal (handled in agent.py - perceive_signal)
+                    agent.perceive_signal(new_signal) # Pass the whole Signal object
+                    recipients.append(agent.id)
+
+        if cfg.DEBUG_SOCIAL and recipients: print(f" -> Signal '{signal_type}' received by agents: {recipients}")
+        if cfg.DEBUG_SOCIAL and not recipients: print(f" -> Signal '{signal_type}' received by no one in range.")
+
+
+    def update(self, dt_sim_seconds):
+         """ Periodic updates: Signal cleanup and relationship decay. """
+         # 1. Clean up old signals from the active list (for visualization/memory)
+         current_time = time.time()
+         self.active_signals = [s for s in self.active_signals
+                                if current_time - s.timestamp < (cfg.SIGNAL_DURATION_TICKS / cfg.FPS) * 1.5] # Keep a bit longer than visualization
+
+         # 2. Apply relationship decay for all agents
+         for agent in self.agents_dict.values():
+             agent.knowledge.decay_relationships(dt_sim_seconds)
+
+# Contents of ui.py
+# ui.py
+import pygame
+import config as cfg
+import time # For signal visualization timing
+
+# Initialize font module
+pygame.font.init()
+try:
+    FONT_SMALL = pygame.font.SysFont('Arial', 16)
+    FONT_MEDIUM = pygame.font.SysFont('Arial', 20)
+    FONT_LARGE = pygame.font.SysFont('Arial', 24)
+except Exception as e:
+    print(f"Error loading system font (Arial): {e}. Using default font.")
+    FONT_SMALL = pygame.font.Font(None, 18)
+    FONT_MEDIUM = pygame.font.Font(None, 24)
+    FONT_LARGE = pygame.font.Font(None, 30)
+
+
+def draw_world(screen, world, social_manager):
+    """ Draws the world grid, terrain, resources, and active signals """
+    game_surf = pygame.Surface((cfg.GAME_WIDTH, cfg.SCREEN_HEIGHT))
+    game_surf.fill(cfg.BLACK)
+
+    # Draw Terrain and Resources (as before)
+    for y in range(world.height):
+        for x in range(world.width):
+            terrain_type = world.terrain_map[y, x]
+            color = cfg.TERRAIN_COLORS.get(terrain_type, cfg.DARK_GRAY)
+            rect = pygame.Rect(x * cfg.CELL_SIZE, y * cfg.CELL_SIZE, cfg.CELL_SIZE, cfg.CELL_SIZE)
+            pygame.draw.rect(game_surf, color, rect)
+
+            resource = world.resource_map[y, x]
+            if resource and (resource.quantity > 0 or resource.type == cfg.RESOURCE_WORKBENCH):
+                res_info = cfg.RESOURCE_INFO.get(resource.type)
+                if res_info:
+                    res_color = res_info['color']
+                    res_size_ratio = 0.7 if resource.type == cfg.RESOURCE_WORKBENCH else 0.6
+                    res_size = int(cfg.CELL_SIZE * res_size_ratio)
+                    offset = (cfg.CELL_SIZE - res_size) // 2
+                    res_rect = pygame.Rect(x * cfg.CELL_SIZE + offset, y * cfg.CELL_SIZE + offset, res_size, res_size)
+                    pygame.draw.rect(game_surf, res_color, res_rect)
+                    pygame.draw.rect(game_surf, cfg.BLACK, res_rect, 1)
+
+    # --- Phase 4: Draw Active Signals ---
+    current_time = time.time()
+    signals_to_draw = social_manager.active_signals # Get current signals
+    for signal in signals_to_draw:
+         time_elapsed = current_time - signal.timestamp
+         # Fade out effect (optional) - decrease alpha over time
+         max_alpha = 200
+         alpha = max(0, int(max_alpha * (1 - (time_elapsed / (cfg.SIGNAL_DURATION_TICKS / cfg.FPS)))))
+         if alpha > 0:
+             try:
+                 # Draw a simple circle indicator for the signal
+                 signal_x, signal_y = signal.position
+                 center_x = signal_x * cfg.CELL_SIZE + cfg.CELL_SIZE // 2
+                 center_y = signal_y * cfg.CELL_SIZE + cfg.CELL_SIZE // 2
+                 radius = cfg.CELL_SIZE // 2
+
+                 # Create a temporary surface for transparency
+                 temp_surf = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
+                 pygame.draw.circle(temp_surf, (*cfg.PURPLE, alpha), (radius, radius), radius) # Use signal color
+                 game_surf.blit(temp_surf, (center_x - radius, center_y - radius))
+
+                 # Optional: Draw signal type text briefly
+                 # if time_elapsed < 0.5: # Only show text for first half second
+                 #    sig_font = pygame.font.Font(None, 14)
+                 #    sig_surf = sig_font.render(signal.type, True, cfg.WHITE)
+                 #    sig_rect = sig_surf.get_rect(center=(center_x, center_y - radius - 5))
+                 #    game_surf.blit(sig_surf, sig_rect)
+
+             except Exception as e: # Catch potential drawing errors
+                 print(f"Warning: Error drawing signal {signal.type}: {e}")
+
+
+    # Blit the game surface onto the main screen
+    screen.blit(game_surf, (0, 0))
+
+
+def draw_agent(screen, agent):
+    """ Draws a single agent on the main screen with a health bar. """
+    if agent.health <= 0: return # Don't draw dead agents
+
+    rect = pygame.Rect(agent.x * cfg.CELL_SIZE, agent.y * cfg.CELL_SIZE, cfg.CELL_SIZE, cfg.CELL_SIZE)
+    center_x = rect.left + cfg.CELL_SIZE // 2
+    center_y = rect.top + cfg.CELL_SIZE // 2
+    radius = cfg.CELL_SIZE // 2 - 2
+    pygame.draw.circle(screen, cfg.RED, (center_x, center_y), radius)
+
+    # Health Bar
+    health_percent = max(0, agent.health / cfg.MAX_HEALTH)
+    bar_width = int(cfg.CELL_SIZE * 0.8); bar_height = 3
+    bar_x = rect.left + (cfg.CELL_SIZE - bar_width) // 2
+    bar_y = rect.top - bar_height - 2
+    bg_rect = pygame.Rect(bar_x, bar_y, bar_width, bar_height)
+    fill_width = int(bar_width * health_percent)
+    fill_rect = pygame.Rect(bar_x, bar_y, fill_width, bar_height)
+    bar_color = cfg.GREEN if health_percent > 0.6 else cfg.YELLOW if health_percent > 0.3 else cfg.RED
+    pygame.draw.rect(screen, cfg.DARK_GRAY, bg_rect)
+    pygame.draw.rect(screen, bar_color, fill_rect)
+
+
+def draw_ui(screen, world, agents, selected_agent, social_manager, clock):
+    """ Draws the UI panel with simulation info and selected agent details (Phase 4). """
+    panel_rect = pygame.Rect(cfg.GAME_WIDTH, 0, cfg.SIDE_PANEL_WIDTH, cfg.SCREEN_HEIGHT)
+    pygame.draw.rect(screen, cfg.UI_BG_COLOR, panel_rect)
+    pygame.draw.line(screen, cfg.WHITE, (cfg.GAME_WIDTH, 0), (cfg.GAME_WIDTH, cfg.SCREEN_HEIGHT), 1)
+
+    y_offset = 10
+    x_margin = cfg.GAME_WIDTH + 10
+    col_width = cfg.SIDE_PANEL_WIDTH - 20
+    lh_small = FONT_SMALL.get_linesize(); lh_medium = FONT_MEDIUM.get_linesize(); lh_large = FONT_LARGE.get_linesize()
+
+    # --- Simulation Info ---
+    sim_time_text = FONT_MEDIUM.render(f"Day: {world.day_count}, Time: {world.day_time:.0f}s", True, cfg.UI_TEXT_COLOR)
+    screen.blit(sim_time_text, (x_margin, y_offset)); y_offset += lh_medium
+    fps_text = FONT_MEDIUM.render(f"FPS: {clock.get_fps():.1f}", True, cfg.UI_TEXT_COLOR)
+    screen.blit(fps_text, (x_margin, y_offset)); y_offset += lh_medium
+    live_agents = len([a for a in agents if a.health > 0])
+    agent_count_text = FONT_MEDIUM.render(f"Agents: {live_agents}", True, cfg.UI_TEXT_COLOR)
+    screen.blit(agent_count_text, (x_margin, y_offset)); y_offset += lh_medium + 10
+
+    # --- Selected Agent Info ---
+    title_text = FONT_LARGE.render("Selected Agent", True, cfg.WHITE)
+    screen.blit(title_text, (x_margin, y_offset)); y_offset += lh_large + 5
+
+    if selected_agent and selected_agent.health > 0:
+        # Agent ID, Position, Sociability
+        soc_text = f"Soc: {selected_agent.sociability:.2f}"
+        agent_id_text = FONT_MEDIUM.render(f"ID: {selected_agent.id} @ ({selected_agent.x},{selected_agent.y}) {soc_text}", True, cfg.UI_TEXT_COLOR)
+        screen.blit(agent_id_text, (x_margin, y_offset)); y_offset += lh_medium
+
+        # Needs Bars (Unchanged from Phase 3)
+        needs_data = [
+            ("Health", selected_agent.health, cfg.MAX_HEALTH, cfg.GREEN, cfg.RED),
+            ("Energy", selected_agent.energy, cfg.MAX_ENERGY, (60, 100, 255), cfg.DARK_GRAY),
+            ("Hunger", cfg.MAX_HUNGER - selected_agent.hunger, cfg.MAX_HUNGER, cfg.ORANGE, cfg.DARK_GRAY),
+            ("Thirst", cfg.MAX_THIRST - selected_agent.thirst, cfg.MAX_THIRST, cfg.BLUE, cfg.DARK_GRAY),
+        ]
+        bar_height_ui=15; bar_label_width=55; bar_width_ui=col_width-bar_label_width-5
+        for name, current, maximum, color_full, color_empty in needs_data:
+            percent=max(0,min(1,current/maximum)) if maximum>0 else 0; fill_width=int(bar_width_ui*percent)
+            name_surf=FONT_SMALL.render(f"{name}:",True,cfg.UI_TEXT_COLOR); screen.blit(name_surf,(x_margin,y_offset+1))
+            is_inverted=name in ["Hunger","Thirst"]; low_thresh=0.3; med_thresh=0.6
+            is_low=percent<low_thresh; is_med=percent<med_thresh and not is_low
+            bar_color=color_full
+            if (is_inverted and (is_low or is_med)) or (not is_inverted and is_low): bar_color=cfg.RED
+            elif (is_inverted and not is_low and not is_med) or (not is_inverted and is_med): bar_color=cfg.YELLOW
+            bg_rect=pygame.Rect(x_margin+bar_label_width,y_offset,bar_width_ui,bar_height_ui)
+            fill_rect=pygame.Rect(x_margin+bar_label_width,y_offset,fill_width,bar_height_ui)
+            pygame.draw.rect(screen,color_empty,bg_rect); pygame.draw.rect(screen,bar_color,fill_rect); pygame.draw.rect(screen,cfg.WHITE,bg_rect,1)
+            try:
+                val_text=f"{current:.0f}" if not is_inverted else f"{maximum-current:.0f}"
+                val_surf=FONT_SMALL.render(val_text,True,cfg.WHITE if percent>0.4 else cfg.BLACK)
+                val_rect=val_surf.get_rect(center=bg_rect.center); screen.blit(val_surf,val_rect)
+            except Exception as e: print(f"Warning: Font render error: {e}")
+            y_offset += bar_height_ui + 4
+        y_offset += 10
+
+        # Current Action (Display includes target ID for social actions)
+        action_name = selected_agent.current_action if selected_agent.current_action else "Idle"
+        target_info_str = ""
+        if selected_agent.action_target:
+            target_id = selected_agent.action_target.get('target_id')
+            goal = selected_agent.action_target.get('goal')
+            recipe = selected_agent.action_target.get('recipe')
+            item = selected_agent.action_target.get('item')
+            skill = selected_agent.action_target.get('skill')
+            sig_type = selected_agent.action_target.get('signal_type')
+
+            if target_id is not None: target_info_str += f" -> Agent {target_id}"
+            if recipe: target_info_str += f" ({recipe})"
+            elif item: target_info_str += f" ({item})"
+            elif skill: target_info_str += f" ({skill})"
+            elif sig_type: target_info_str += f" ({sig_type})"
+            elif goal and goal != (selected_agent.x, selected_agent.y): target_info_str += f" @{goal}"
+
+
+        action_text = FONT_MEDIUM.render(f"Action: {action_name}{target_info_str}", True, cfg.YELLOW)
+        screen.blit(action_text, (x_margin, y_offset)); y_offset += lh_medium
+
+        # Inventory (Unchanged)
+        inv_sum = sum(selected_agent.inventory.values())
+        inv_title = FONT_MEDIUM.render(f"Inventory ({inv_sum}/{cfg.INVENTORY_CAPACITY}):", True, cfg.WHITE)
+        screen.blit(inv_title, (x_margin, y_offset)); y_offset += lh_medium
+        if not selected_agent.inventory: screen.blit(FONT_SMALL.render("  Empty", True, cfg.UI_TEXT_COLOR), (x_margin + 5, y_offset)); y_offset += lh_small
+        else:
+             items_list = sorted(list(selected_agent.inventory.items()))
+             for item, count in items_list: screen.blit(FONT_SMALL.render(f"  {item}: {count}", True, cfg.UI_TEXT_COLOR), (x_margin + 5, y_offset)); y_offset += lh_small
+        y_offset += 10
+
+        # Skills (Unchanged)
+        skills_title = FONT_MEDIUM.render("Skills:", True, cfg.WHITE)
+        screen.blit(skills_title, (x_margin, y_offset)); y_offset += lh_medium
+        skills_to_show = {k: v for k, v in sorted(selected_agent.skills.items()) if v >= 0.1}
+        if not skills_to_show: screen.blit(FONT_SMALL.render("  None", True, cfg.UI_TEXT_COLOR), (x_margin + 5, y_offset)); y_offset += lh_small
+        else:
+            skills_list = list(skills_to_show.items()); rows = (len(skills_list) + 1) // 2
+            col1_width = col_width // 2 - 5; col2_x = x_margin + col1_width + 10
+            for i in range(rows):
+                 skill_left, level_left = skills_list[i]; text_left = f"  {skill_left}: {level_left:.1f}"
+                 surf_left = FONT_SMALL.render(text_left, True, cfg.UI_TEXT_COLOR); screen.blit(surf_left, (x_margin + 5, y_offset))
+                 idx_right = i + rows
+                 if idx_right < len(skills_list):
+                     skill_right, level_right = skills_list[idx_right]; text_right = f"  {skill_right}: {level_right:.1f}"
+                     surf_right = FONT_SMALL.render(text_right, True, cfg.UI_TEXT_COLOR); screen.blit(surf_right, (col2_x, y_offset))
+                 y_offset += lh_small
+        y_offset += 10
+
+        # Known Recipes (Unchanged)
+        recipes_title = FONT_MEDIUM.render("Known Recipes:", True, cfg.WHITE)
+        screen.blit(recipes_title, (x_margin, y_offset)); y_offset += lh_medium
+        known_recipes = sorted(list(selected_agent.knowledge.known_recipes))
+        if not known_recipes: screen.blit(FONT_SMALL.render("  None", True, cfg.UI_TEXT_COLOR), (x_margin + 5, y_offset)); y_offset += lh_small
+        else:
+             current_x = x_margin + 5; max_panel_width = cfg.SIDE_PANEL_WIDTH - 15
+             for i, recipe in enumerate(known_recipes):
+                 recipe_text = f"{recipe}" + (", " if i < len(known_recipes)-1 else ""); recipe_surf = FONT_SMALL.render(recipe_text, True, cfg.UI_TEXT_COLOR)
+                 recipe_rect = recipe_surf.get_rect(topleft=(current_x, y_offset))
+                 if recipe_rect.right > cfg.GAME_WIDTH + max_panel_width and current_x > x_margin + 5:
+                      y_offset += lh_small; current_x = x_margin + 5; recipe_rect.topleft = (current_x, y_offset)
+                 screen.blit(recipe_surf, recipe_rect); current_x = recipe_rect.right + 2
+             y_offset += lh_small
+        y_offset += 10
+
+        # --- Phase 4: Relationships ---
+        rels_title = FONT_MEDIUM.render("Relationships:", True, cfg.WHITE)
+        screen.blit(rels_title, (x_margin, y_offset)); y_offset += lh_medium
+        relationships = sorted(selected_agent.knowledge.relationships.items())
+        if not relationships:
+             screen.blit(FONT_SMALL.render("  None known", True, cfg.UI_TEXT_COLOR), (x_margin + 5, y_offset)); y_offset += lh_small
+        else:
+             # Simple list for now
+             for other_id, score in relationships:
+                  # Check if agent is still alive (optional, relationship might persist)
+                  # other_agent = world.get_agent_by_id(other_id)
+                  # status = "" if other_agent and other_agent.health > 0 else " (Dead?)"
+                  rel_text = f"  Agent {other_id}: {score:.2f}" #+ status
+                  rel_color = cfg.GREEN if score > 0.5 else cfg.YELLOW if score > -0.2 else cfg.RED
+                  screen.blit(FONT_SMALL.render(rel_text, True, rel_color), (x_margin + 5, y_offset))
+                  y_offset += lh_small
+                  # Limit displayed relationships if too many?
+                  if y_offset > cfg.SCREEN_HEIGHT - 30: # Avoid drawing off screen
+                       screen.blit(FONT_SMALL.render("  ...", True, cfg.UI_TEXT_COLOR), (x_margin + 5, y_offset)); y_offset += lh_small
+                       break
+
+
+    else: # No agent selected
+        no_select_text = FONT_MEDIUM.render("Click on an agent to select", True, cfg.UI_TEXT_COLOR)
+        screen.blit(no_select_text, (x_margin, y_offset))
+
+# Contents of world.py
+# world.py
+import random
+import numpy as np
+import config as cfg
+from pathfinding_utils import create_walkability_matrix
+import pickle
+import time
+import math
+import traceback
+
+class Resource:
+    """ Represents a resource node in the world (e.g., Tree, Rock, Workbench). """
+    def __init__(self, type, x, y, quantity=None, max_quantity=None, regen_rate=None):
+        """ Initializes a resource instance. """
+        self.type = type
+        self.x = x
+        self.y = y
+
+        # Get defaults from config if not provided
+        res_info = cfg.RESOURCE_INFO.get(type, {})
+        self.max_quantity = max_quantity if max_quantity is not None else res_info.get('max_quantity', 1)
+        self.quantity = quantity if quantity is not None else self.max_quantity # Start full by default
+        self.regen_rate = regen_rate if regen_rate is not None else res_info.get('regen', 0)
+
+        # Derived attributes from config (set here and in __setstate__)
+        self.name = res_info.get('name', 'Unknown')
+        self.blocks_walk = res_info.get('block_walk', False)
+
+    def consume(self, amount=1):
+        """ Consumes a specified amount of the resource. Returns amount actually consumed. """
+        consumed = min(amount, self.quantity)
+        self.quantity -= consumed
+        return consumed
+
+    def update(self, dt_sim_seconds):
+        """ Updates resource quantity based on regeneration rate (if applicable). """
+        if self.regen_rate > 0 and self.quantity < self.max_quantity:
+             # Probabilistic regeneration check
+             if random.random() < self.regen_rate * dt_sim_seconds:
+                 self.quantity = min(self.max_quantity, self.quantity + 1)
+
+    def is_depleted(self):
+        """ Returns True if the resource quantity is zero or less. """
+        return self.quantity <= 0
+
+    # --- Persistence Methods (for saving/loading) ---
+    def __getstate__(self):
+        """ Defines which attributes are saved when pickling. """
+        # Store only essential data; derived attributes will be reconstructed on load.
+        return (self.type, self.x, self.y, self.quantity, self.max_quantity, self.regen_rate)
+
+    def __setstate__(self, state):
+        """ Defines how to restore the object state when unpickling. """
+        # Unpack the saved state tuple
+        self.type, self.x, self.y, self.quantity, self.max_quantity, self.regen_rate = state
+
+        # Re-initialize derived attributes from config based on the loaded type
+        res_info = cfg.RESOURCE_INFO.get(self.type, {})
+        self.name = res_info.get('name', 'Unknown')
+        self.blocks_walk = res_info.get('block_walk', False)
+
+        # Handle potential missing attributes from older save files (optional robustness)
+        if self.regen_rate is None: self.regen_rate = res_info.get('regen', 0)
+        if self.max_quantity is None: self.max_quantity = res_info.get('max_quantity', 1)
+
+class World:
+    """ Manages the simulation grid, terrain, resources, time, and basic world queries. """
+    def __init__(self, width, height):
+        """ Initializes the world grid and generates initial layout. """
+        self.width = width
+        self.height = height
+        # Terrain map: Stores terrain type (Ground, Water, Obstacle) for each tile
+        self.terrain_map = np.full((height, width), cfg.TERRAIN_GROUND, dtype=int)
+        # Resource map: Stores Resource object or None for each tile
+        self.resource_map = np.full((height, width), None, dtype=object)
+        # List of all active Resource objects (for efficient iteration)
+        self.resources = []
+        # Walkability matrix (1=walkable, 0=obstacle) derived from terrain and resources
+        self.walkability_matrix = None
+        # Simulation time tracking
+        self.simulation_time = 0.0
+        self.day_time = 0.0
+        self.day_count = 0
+        # Dictionary for quick agent lookup by ID (updated externally)
+        self.agents_by_id = {}
+
+        # Generate initial world features
+        self._generate_world()
+        # Calculate initial walkability based on generated features
+        self.update_walkability()
+
+    def _generate_world(self):
+        """ Generates the initial terrain (water) and resource layout. """
+        print("Generating world terrain and resources...")
+        start_time = time.time()
+
+        # 1. Place Water Patches
+        if cfg.DEBUG_WORLD_GEN: print(f"  Placing {cfg.NUM_WATER_PATCHES} water patches...")
+        for _ in range(cfg.NUM_WATER_PATCHES):
+            size_x = random.randint(cfg.WATER_PATCH_SIZE[0], cfg.WATER_PATCH_SIZE[1])
+            size_y = random.randint(cfg.WATER_PATCH_SIZE[0], cfg.WATER_PATCH_SIZE[1])
+            start_x = random.randint(0, self.width - size_x)
+            start_y = random.randint(0, self.height - size_y)
+            # Set terrain type to Water within the patch boundaries
+            self.terrain_map[start_y:start_y+size_y, start_x:start_x+size_x] = cfg.TERRAIN_WATER
+
+        # 2. Place Resource Objects (Food, Wood, Stone, Initial Workbenches)
+        if cfg.DEBUG_WORLD_GEN: print("  Placing resources...")
+        resource_placements = {
+            cfg.RESOURCE_FOOD: cfg.NUM_FOOD_SOURCES,
+            cfg.RESOURCE_WOOD: cfg.NUM_TREES,
+            cfg.RESOURCE_STONE: cfg.NUM_ROCKS,
+            cfg.RESOURCE_WORKBENCH: cfg.NUM_INITIAL_WORKBENCHES # Include workbenches
+        }
+
+        for res_type, count in resource_placements.items():
+            if count <= 0: continue # Skip if zero count configured
+            placed = 0
+            attempts = 0
+            # Allow more attempts for placing resources, especially if map is dense
+            max_attempts = count * 200
+            res_info = cfg.RESOURCE_INFO.get(res_type, {})
+            res_name = res_info.get('name', f'Type {res_type}')
+            if cfg.DEBUG_WORLD_GEN: print(f"    Attempting to place {count} {res_name}...")
+
+            while placed < count and attempts < max_attempts:
+                # Choose random coordinates
+                x = random.randint(0, self.width - 1)
+                y = random.randint(0, self.height - 1)
+
+                # Check placement validity: Must be on Ground terrain and the tile must be empty
+                is_valid_terrain = (self.terrain_map[y, x] == cfg.TERRAIN_GROUND)
+                is_empty = self.resource_map[y, x] is None
+
+                if is_valid_terrain and is_empty:
+                    # Create the resource instance
+                    resource = Resource(res_type, x, y)
+                    # Use add_world_object to handle map/list updates and logging
+                    if self.add_world_object(resource, x, y):
+                         placed += 1
+                attempts += 1
+
+            # Log outcome of placement attempts
+            if placed < count:
+                 print(f"    Warning: Could only place {placed}/{count} of {res_name} (tried {attempts} times)")
+            elif cfg.DEBUG_WORLD_GEN:
+                 print(f"    Successfully placed {placed}/{count} of {res_name}.")
+
+        if cfg.DEBUG_WORLD_GEN:
+             print(f"World generation completed in {time.time() - start_time:.2f} seconds.")
+
+
+    def update_walkability(self, agent_positions=None):
+         """
+         Recalculates the walkability matrix based on terrain and blocking resources.
+         If agent_positions is provided, returns a temporary matrix with agents blocked,
+         otherwise updates self.walkability_matrix.
+         """
+         # Create base matrix considering terrain and blocking resources
+         matrix = create_walkability_matrix(self.terrain_map, self.resource_map)
+
+         if agent_positions:
+             # Create a temporary copy and mark agent positions as non-walkable
+             temp_matrix = matrix.copy()
+             for x, y in agent_positions:
+                 if 0 <= x < self.width and 0 <= y < self.height:
+                     temp_matrix[y, x] = 0 # Mark agent position as obstacle
+             return temp_matrix
+         else:
+             # Update the world's persistent walkability matrix
+             self.walkability_matrix = matrix
+             return self.walkability_matrix
+
+    def update(self, dt_real_seconds, agents):
+        """ Updates world time and resource regeneration. Agent dict updated in main loop. """
+        dt_sim_seconds = dt_real_seconds * cfg.SIMULATION_SPEED_FACTOR
+
+        # Update simulation time and day cycle
+        self.simulation_time += dt_sim_seconds
+        self.day_time = (self.day_time + dt_sim_seconds) % cfg.DAY_LENGTH_SECONDS
+        self.day_count = int(self.simulation_time // cfg.DAY_LENGTH_SECONDS)
+
+        # Update resource regeneration
+        # Iterate over a copy `[:]` in case resources get removed during update (optional)
+        for resource in self.resources[:]:
+            resource.update(dt_sim_seconds)
+            # Optional: Remove depleted, non-regenerating resources here if desired
+            # if resource.is_depleted() and resource.regen_rate <= 0 and resource.type != cfg.RESOURCE_WORKBENCH:
+            #    self.remove_world_object(resource.x, resource.y)
+
+        # Note: self.agents_by_id is updated in the main simulation loop after agent updates/deaths
+
+
+    def get_terrain(self, x, y):
+        """ Returns terrain type at (x, y), handling bounds checks. """
+        if 0 <= x < self.width and 0 <= y < self.height:
+             return self.terrain_map[y, x]
+        return cfg.TERRAIN_OBSTACLE # Treat out-of-bounds as obstacle
+
+
+    def get_resource(self, x, y):
+        """ Returns Resource object at (x, y) or None, handling bounds checks. """
+        if 0 <= x < self.width and 0 <= y < self.height:
+             return self.resource_map[y, x]
+        return None
+
+
+    def consume_resource_at(self, x, y, amount=1):
+        """ Consumes resource at location, returns amount actually consumed. Handles implicit Water. """
+        if not (0 <= x < self.width and 0 <= y < self.height):
+             return 0 # Out of bounds
+
+        # Check for Resource object first
+        resource = self.resource_map[y, x]
+        if resource and not resource.is_depleted():
+            consumed = resource.consume(amount)
+            # Optional: Remove depleted non-regenerating resources immediately
+            # if resource.is_depleted() and resource.regen_rate <= 0:
+            #    self.remove_world_object(x,y)
+            return consumed
+        # Check for Water terrain if no consumable resource object found
+        elif self.terrain_map[y, x] == cfg.TERRAIN_WATER:
+            return amount # Water is effectively infinite for consumption
+        return 0 # No consumable resource found
+
+
+    def find_nearest_resource(self, start_x, start_y, resource_type, max_dist=cfg.AGENT_VIEW_RADIUS):
+        """
+        Performs a Breadth-First Search (BFS) from (start_x, start_y) to find the nearest
+        resource of the specified type within max_dist.
+        Returns (goal_pos, stand_pos, distance) or (None, None, float('inf')).
+        goal_pos: The (x, y) of the resource tile itself.
+        stand_pos: A walkable (x, y) adjacent to or on the resource tile to interact from.
+        """
+        # Basic input validation
+        if not (0 <= start_x < self.width and 0 <= start_y < self.height):
+             print(f"Warning: find_nearest_resource called with invalid start ({start_x},{start_y})")
+             return None, None, float('inf')
+
+        # Initialize BFS queue and visited set
+        # Queue stores (x, y, distance_from_start)
+        q = [(start_x, start_y, 0)]
+        visited = set([(start_x, start_y)])
+        # Use the world's base walkability grid for the search (ignoring agents)
+        walkability = self.walkability_matrix
+
+        while q:
+            curr_x, curr_y, dist = q.pop(0)
+
+            # Stop searching if distance limit exceeded
+            if dist >= max_dist: continue
+
+            # --- Check CURRENT tile (curr_x, curr_y) for the target resource ---
+            target_found = False
+            goal_pos = (curr_x, curr_y) # Assume current tile is the goal for now
+            stand_pos = None            # Position to stand to interact
+
+            # Case 1: Searching for Water
+            if resource_type == cfg.RESOURCE_WATER:
+                if self.get_terrain(curr_x, curr_y) == cfg.TERRAIN_WATER:
+                    # Found water tile, now find adjacent walkable ground to stand on
+                    stand_pos = self._find_adjacent_walkable(curr_x, curr_y, walkability)
+                    if stand_pos: target_found = True
+            # Case 2: Searching for a specific Resource object type
+            else:
+                resource = self.get_resource(curr_x, curr_y)
+                if resource and resource.type == resource_type and not resource.is_depleted():
+                    # Found the correct resource type, now find where to stand
+                    if walkability[curr_y, curr_x] == 1:
+                        # Resource is on a walkable tile (e.g., Workbench), stand on it.
+                        stand_pos = (curr_x, curr_y)
+                        target_found = True
+                    else:
+                        # Resource blocks walking (e.g., Tree, Rock), find adjacent walkable.
+                        stand_pos = self._find_adjacent_walkable(curr_x, curr_y, walkability)
+                        if stand_pos: target_found = True
+
+            # --- If Target Found ---
+            if target_found:
+                # Return the goal position, valid standing position, and BFS grid distance
+                if cfg.DEBUG_PATHFINDING or cfg.DEBUG_KNOWLEDGE:
+                     res_name = "Water" if resource_type == cfg.RESOURCE_WATER else cfg.RESOURCE_INFO.get(resource_type, {}).get('name', '?')
+                     print(f"  World BFS Found: {res_name} at {goal_pos}, stand at {stand_pos}, grid dist {dist}")
+                return goal_pos, stand_pos, dist
+
+            # --- Explore Neighbors ---
+            # Explore neighbors using 8-directional movement (including diagonals)
+            neighbors = [(0,1), (0,-1), (1,0), (-1,0), (1,1), (1,-1), (-1,1), (-1,-1)]
+            random.shuffle(neighbors) # Avoid directional bias in exploration
+            for dx, dy in neighbors:
+                nx, ny = curr_x + dx, curr_y + dy
+                # Check bounds and if neighbor has already been visited
+                if 0 <= nx < self.width and 0 <= ny < self.height and (nx, ny) not in visited:
+                     visited.add((nx, ny))
+                     # Add neighbor to queue to check later
+                     q.append((nx, ny, dist + 1))
+
+        # If queue becomes empty and target not found
+        return None, None, float('inf')
+
+
+    def _find_adjacent_walkable(self, x, y, walkability_matrix):
+        """ Finds the first walkable tile adjacent (including diagonals) to (x, y). """
+        neighbors = [(0,-1), (0,1), (1,0), (-1,0), (1,-1), (1,1), (-1,1), (-1,-1)]
+        for dx, dy in neighbors:
+            nx, ny = x + dx, y + dy
+            if 0 <= nx < self.width and 0 <= ny < self.height and walkability_matrix[ny, nx] == 1:
+                return (nx, ny)
+        return None # No walkable neighbor found
+
+
+    def add_world_object(self, obj, x, y):
+        """
+        Adds an object (like a Resource) to the world at (x, y).
+        Updates resource_map, resources list, and walkability matrix if needed.
+        Returns True if successful, False otherwise.
+        """
+        if not (0 <= x < self.width and 0 <= y < self.height):
+             print(f"Warning: Attempted to add object outside world bounds at ({x},{y})")
+             return False
+
+        # Check if placement location is valid (Ground terrain and currently empty)
+        if self.terrain_map[y, x] == cfg.TERRAIN_GROUND and self.resource_map[y, x] is None:
+             # Place object on the map
+             self.resource_map[y, x] = obj
+             # If it's a Resource object, add it to the list for updates
+             if isinstance(obj, Resource):
+                 if obj not in self.resources: # Avoid adding duplicates
+                      self.resources.append(obj)
+
+             # Update walkability matrix if the new object blocks movement
+             if getattr(obj, 'blocks_walk', False):
+                 self.update_walkability() # Recalculate the base walkability
+
+             if cfg.DEBUG_WORLD_GEN or cfg.DEBUG_AGENT_ACTIONS: # Log placement
+                 print(f"World: Added object '{getattr(obj, 'name', '?')}' at ({x},{y})")
+             return True
+        else:
+             # Log failure reason
+             if cfg.DEBUG_WORLD_GEN or cfg.DEBUG_AGENT_ACTIONS:
+                 reason = "not ground" if self.terrain_map[y, x] != cfg.TERRAIN_GROUND else "tile occupied"
+                 print(f"World: Failed to add object '{getattr(obj, 'name', '?')}' at ({x},{y}) - {reason}")
+             return False
+
+
+    def remove_world_object(self, x, y):
+         """ Removes object at (x,y), updating map, list, and walkability. Returns True if successful. """
+         if not (0 <= x < self.width and 0 <= y < self.height):
+              return False # Out of bounds
+
+         obj = self.resource_map[y, x]
+         if obj is not None:
+             was_blocking = getattr(obj, 'blocks_walk', False)
+             # Remove from map
+             self.resource_map[y, x] = None
+             # Remove from resource list if applicable
+             if isinstance(obj, Resource) and obj in self.resources:
+                 try:
+                    self.resources.remove(obj)
+                 except ValueError: # Should not happen if logic is correct
+                     if cfg.DEBUG_WORLD_GEN: print(f"Warning: Tried to remove resource from list but it wasn't found: {obj}")
+
+             # Update walkability only if a blocking object was removed
+             if was_blocking:
+                 self.update_walkability()
+
+             if cfg.DEBUG_WORLD_GEN or cfg.DEBUG_AGENT_ACTIONS:
+                  print(f"World: Removed object '{getattr(obj, 'name', '?')}' from ({x},{y})")
+             return True
+         return False # Nothing to remove at location
+
+
+    def get_agent_by_id(self, agent_id):
+        """ Returns the agent object with the given ID, or None if not found/dead. """
+        # Uses the dictionary updated in the main loop
+        return self.agents_by_id.get(agent_id)
+
+
+    # --- Persistence (Save/Load World State) ---
+    def save_state(self, filename="world_save.pkl"):
+        """ Saves the current world state (terrain, resources, time) to a file using pickle. """
+        # Note: Agent states are NOT saved here; that requires separate logic.
+        # self.agents_by_id is transient and rebuilt after agent loading/creation.
+        state = {
+            'width': self.width,
+            'height': self.height,
+            'terrain_map': self.terrain_map,
+            'resources': self.resources, # Save the list of Resource objects
+            'simulation_time': self.simulation_time,
+            'day_time': self.day_time,
+            'day_count': self.day_count
+        }
+        try:
+            with open(filename, 'wb') as f:
+                pickle.dump(state, f)
+            print(f"World state saved to {filename}")
+        except Exception as e:
+            print(f"Error saving world state: {e}")
+            traceback.print_exc()
+
+    def load_state(self, filename="world_save.pkl"):
+        """ Loads world state from a file. Returns True on success, False otherwise. """
+        try:
+            with open(filename, 'rb') as f:
+                state = pickle.load(f)
+
+            # Restore basic attributes
+            self.width = state['width']
+            self.height = state['height']
+            self.terrain_map = state['terrain_map']
+            self.simulation_time = state['simulation_time']
+            self.day_time = state['day_time']
+            self.day_count = state['day_count']
+            loaded_resources = state.get('resources', []) # Use .get for potential backward compatibility
+
+            # --- Rebuild resource map and list from loaded resources ---
+            self.resource_map = np.full((self.height, self.width), None, dtype=object)
+            self.resources = [] # Start with empty list, add valid loaded resources back
+
+            for resource_state in loaded_resources:
+                 resource = None
+                 try:
+                     # Check if loaded data is a state tuple or already an object
+                     if isinstance(resource_state, tuple):
+                         # If it's a tuple (from __getstate__), reconstruct the object
+                         res_obj = Resource(0,0,0) # Create dummy object
+                         res_obj.__setstate__(resource_state) # Populate from state
+                         resource = res_obj
+                     elif isinstance(resource_state, Resource):
+                         # If it's already an object, ensure derived attributes are refreshed
+                         resource = resource_state
+                         resource.__setstate__(resource.__getstate__()) # Call setstate to refresh name, blocks_walk etc.
+                     else:
+                          print(f"Warning: Unknown data type found in loaded resources list: {type(resource_state)}")
+                          continue # Skip unknown data
+
+                     # Validate coordinates and place on map/list
+                     if 0 <= resource.x < self.width and 0 <= resource.y < self.height:
+                         if self.resource_map[resource.y, resource.x] is None:
+                              self.resource_map[resource.y, resource.x] = resource
+                              self.resources.append(resource) # Add to the primary list
+                         else:
+                              # Handle conflict: Tile already occupied on map after loading previous resource
+                              print(f"Warning: Conflict loading resource '{getattr(resource,'name','?')}' at ({resource.x},{resource.y}). Tile already occupied on map. Overwriting map, keeping list resource.")
+                              self.resource_map[resource.y, resource.x] = resource # Overwrite map
+                              if resource not in self.resources: self.resources.append(resource) # Ensure it's in list
+                     else:
+                          print(f"Warning: Loaded resource at invalid coords ({resource.x},{resource.y}). Discarding.")
+
+                 except Exception as e:
+                      print(f"Error processing loaded resource state: {e}. Resource State: {resource_state}")
+                      traceback.print_exc()
+                      continue # Skip problematic resource
+
+            # Recalculate walkability based on loaded terrain and resources
+            self.update_walkability()
+            # Clear agent dictionary; needs to be rebuilt after agents are loaded/created
+            self.agents_by_id = {}
+            print(f"World state loaded from {filename}. Resource count: {len(self.resources)}")
+            # Verify workbench count after load
+            wb_count = sum(1 for r in self.resources if r.type == cfg.RESOURCE_WORKBENCH)
+            print(f"  Workbenches loaded: {wb_count}")
+            return True
+
+        except FileNotFoundError:
+            print(f"Save file {filename} not found.")
+            return False
+        except Exception as e:
+            print(f"Error loading world state: {e}")
+            traceback.print_exc()
+            return False
+
