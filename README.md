@@ -1,6 +1,9 @@
 
 **Project Title:** Project Genesis 
 
+![Project](asst/demo.gif)
+
+
 **Core Vision:** A persistent, real-time simulation sandbox where autonomous agents evolve complex behaviors, skills, and social structures through interaction with the environment and each other.
 
 **Key Pillars:**
